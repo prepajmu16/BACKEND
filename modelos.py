@@ -14,10 +14,26 @@ class Usuario(db.Model):
     correo = db.Column(db.String(100), unique=True, nullable=False)
     contraseña = db.Column(db.String(255), nullable=False)
     rol = db.Column(db.Enum('ADMIN','ALUMNO'), nullable=False)
+    
+    # ✅ NUEVO CAMPO: Puesto (Cargo administrativo)
+    # Es nullable=True porque los alumnos no tienen puesto
+    puesto = db.Column(db.String(50), nullable=True)
+
     estado = db.Column(db.Enum('ACTIVO','INACTIVO'), default='ACTIVO')
 
+    # Relaciones
     alumno = db.relationship('Alumno', back_populates='usuario', uselist=False)
     bitacoras = db.relationship('Bitacora', back_populates='usuario')
+    
+    def to_dict(self):
+        return {
+            "id": self.id_usuario,
+            "nombre": self.nombre,
+            "usuario": self.correo, # Recuerda: puede ser correo o matrícula
+            "rol": self.rol,
+            "puesto": self.puesto,  # Si es alumno, esto devolverá null automáticamente
+            "estado": self.estado
+        }
 
 
 # ==============================
@@ -77,6 +93,9 @@ class Alumno(db.Model):
 # ==============================
 # ESTRUCTURA DE PAGO
 # ==============================
+# ==============================
+# ESTRUCTURA DE PAGO
+# ==============================
 class EstructuraPago(db.Model):
     __tablename__ = 'estructura_pago'
 
@@ -85,7 +104,10 @@ class EstructuraPago(db.Model):
     tipo = db.Column(db.Enum('INSCRIPCION','MENSUALIDAD','EEE'), nullable=False)
     concepto = db.Column(db.String(100))
     mes = db.Column(db.Integer)
-    anio = db.Column('año', db.Integer)  # mapeo correcto del campo con ñ
+    
+    # ✅ CORRECCIÓN: Quitamos el mapeo 'año' y dejamos el nombre real de tu tabla
+    anio = db.Column(db.Integer)  
+    
     monto = db.Column(db.Numeric(10,2), nullable=False)
 
     generacion = db.relationship('Generacion', back_populates='estructuras')
