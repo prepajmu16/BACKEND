@@ -71,7 +71,7 @@ class Grupo(db.Model):
     alumnos = db.relationship('Alumno', back_populates='grupo')
 
 # ==============================
-# ALUMNO
+# ALUMNO - ACTUALIZADO CON SEMESTRE
 # ==============================
 class Alumno(db.Model):
     __tablename__ = 'alumno'
@@ -80,7 +80,12 @@ class Alumno(db.Model):
     matricula = db.Column(db.String(20), unique=True, nullable=False)
     nombre = db.Column(db.String(100), nullable=False)
     apellido = db.Column(db.String(100), nullable=False)
-    estatus = db.Column(db.Enum('ACTIVO','BAJA','SUSPENDIDO'), default='ACTIVO')
+    
+    # ✅ Se agregó 'EGRESADO' al Enum para el fin de la trayectoria
+    estatus = db.Column(db.Enum('ACTIVO','BAJA','SUSPENDIDO','EGRESADO'), default='ACTIVO')
+    
+    # ✅ NUEVO: Campo para controlar en qué semestre va (1 al 6)
+    semestre_actual = db.Column(db.Integer, default=1, nullable=False)
 
     id_generacion = db.Column(db.Integer, db.ForeignKey('generacion.id_generacion'), nullable=False)
     id_usuario = db.Column(db.Integer, db.ForeignKey('usuario.id_usuario'), unique=True)
@@ -92,7 +97,6 @@ class Alumno(db.Model):
     grupo = db.relationship('Grupo', back_populates='alumnos')
     pagos = db.relationship('Pago', back_populates='alumno')
 
-    # ✅ NUEVO: Este método convierte el objeto de SQLAlchemy en un Diccionario para Angular
     def to_dict(self):
         return {
             "id_alumno": self.id_alumno,
@@ -100,20 +104,22 @@ class Alumno(db.Model):
             "nombre": self.nombre,
             "apellido": self.apellido,
             "estatus": self.estatus,
+            
+            # ✅ Ahora enviamos el semestre actual a Angular
+            "semestre_actual": self.semestre_actual,
+            
             "id_generacion": self.id_generacion,
             "id_grupo": self.id_grupo,
             
-            # 🔗 Accedemos a los nombres reales a través de las relaciones
+            # Nombres reales a través de relaciones
             "nombre_gen": self.generacion.nombre if self.generacion else "Sin Generación",
-            "nombre_grupo": self.grupo.nombre_grupo if self.grupo else "Sin Grupo",
+            "letra_grupo": self.grupo.nombre_grupo if self.grupo else "S/G",
             
-            # 💰 Calculamos el adeudo al vuelo revisando la lista de pagos
+            # Adeudo calculado
             "tieneAdeudo": any(p.estado == 'PENDIENTE' for p in self.pagos)
         }
 
-# ==============================
-# ESTRUCTURA DE PAGO
-# ==============================
+
 # ==============================
 # ESTRUCTURA DE PAGO
 # ==============================

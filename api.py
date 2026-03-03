@@ -130,69 +130,197 @@ def registrar_usuario():
         return jsonify({"error": str(e)}), 500
 
 # ==========================
-# MÓDULO DE ALUMNOS (Inscripción)
+# MÓDULO DE ALUMNOS (Inscripción y Listado)
 # ==========================
+
+@app.route("/alumnos", methods=["GET"])
+def listar_alumnos():
+    try:
+        # Usamos outerjoin para traer al alumno aunque no tenga grupo asignado (como Carlos)
+        alumnos = Alumno.query.all()
+        # El to_dict() que definiste en modelos.py se encarga de los nombres de gen y grupo
+        return jsonify([a.to_dict() for a in alumnos]), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
 @app.route("/alumnos", methods=["POST"])
 def registrar_alumno():
     data = request.get_json()
 
-    if not all(k in data for k in ("matricula", "nombre", "apellido", "id_generacion")):
-        return jsonify({"error": "Faltan datos (matricula, nombre, apellido, id_generacion)"}), 400
+    # Validación básica
+    campos = ("matricula", "nombre", "apellido", "id_generacion", "id_grupo")
+    if not all(k in data for k in campos):
+        return jsonify({"error": "Faltan datos obligatorios"}), 400
 
     if Alumno.query.filter_by(matricula=data["matricula"]).first():
         return jsonify({"error": "La matrícula ya existe"}), 400
 
     try:
-        # 1. CREAR USUARIO (Login)
+        # 1. Crear Usuario para el portal
         nuevo_usuario = Usuario(
             nombre=f"{data['nombre']} {data['apellido']}",
             correo=data["matricula"],
             contraseña=generate_password_hash(data["matricula"]),
-            rol='ALUMNO',
-            estado='ACTIVO'
+            rol='ALUMNO'
         )
         db.session.add(nuevo_usuario)
         db.session.flush() 
 
-        # 2. CREAR ALUMNO (Perfil)
+        # 2. Crear Alumno con el Semestre 1 por defecto
         nuevo_alumno = Alumno(
             matricula=data["matricula"],
             nombre=data["nombre"],
             apellido=data["apellido"],
             id_generacion=data["id_generacion"],
+            id_grupo=data["id_grupo"], # Ya permite el ID de los grupos A o B que creamos
             id_usuario=nuevo_usuario.id_usuario,
+            semestre_actual=1, # ✅ Aseguramos que entre a 1ro para que Angular lo vea
             estatus='ACTIVO'
         )
         db.session.add(nuevo_alumno)
         db.session.flush()
 
-        # 3. GENERAR ADEUDOS
+        # 3. Generar Adeudos automáticos
         conceptos = EstructuraPago.query.filter_by(id_generacion=data["id_generacion"]).all()
-        
-        pagos_creados = 0
         for c in conceptos:
             pago = Pago(
                 id_alumno=nuevo_alumno.id_alumno,
                 id_estructura=c.id_estructura,
-                monto_pagado=0,
                 estado='PENDIENTE',
                 numero_oportunidad=1
             )
             db.session.add(pago)
-            pagos_creados += 1
 
         db.session.commit()
-
-        return jsonify({
-            "message": "Alumno inscrito correctamente",
-            "usuario": data["matricula"],
-            "pagos_generados": pagos_creados
-        }), 201
+        return jsonify({"message": "Inscripción exitosa", "usuario": data["matricula"]}), 201
 
     except Exception as e:
         db.session.rollback()
         return jsonify({"error": str(e)}), 500
+    
+@app.route("/alumnos/<string:matricula>", methods=["PUT"])
+def actualizar_estatus_alumno(matricula):
+    data = request.get_json()
+    alumno = Alumno.query.filter_by(matricula=matricula).first()
 
+    if not alumno:
+        return jsonify({"error": "Alumno no encontrado"}), 404
+
+    try:
+        # Actualizamos solo lo que venga en el JSON
+        if "estatus" in data:
+            alumno.estatus = data["estatus"]
+        if "semestre_actual" in data:
+            alumno.semestre_actual = int(data["semestre_actual"])
+        if "id_grupo" in data:
+            alumno.id_grupo = data["id_grupo"]
+
+        db.session.commit()
+
+        # Opcional: Registrar el movimiento en bitácora
+        nueva_bitacora = Bitacora(
+            id_usuario=1, 
+            accion="ACTUALIZAR_TRAYECTORIA",
+            descripcion=f"Alumno {matricula} movido a {alumno.estatus} en Semestre {alumno.semestre_actual}"
+        )
+        db.session.add(nueva_bitacora)
+        db.session.commit()
+
+        return jsonify({"message": "Trayectoria actualizada correctamente"}), 200
+
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({"error": str(e)}), 500  
+    
+# ✅ Asegúrate de incluir methods=["POST"]
+@app.route("/alumnos/promocion-masiva", methods=["POST"])
+def promocion_masiva():
+    data = request.get_json()
+    id_gen = data.get("id_generacion")
+    
+    if not id_gen:
+        return jsonify({"error": "Debes especificar la generación"}), 400
+
+    try:
+        # 1. Los que están en 6to semestre pasan a ser 'EGRESADO'
+        db.session.query(Alumno).filter(
+            Alumno.id_generacion == id_gen,
+            Alumno.semestre_actual == 6,
+            Alumno.estatus == 'ACTIVO'
+        ).update({Alumno.estatus: 'EGRESADO'}, synchronize_session=False)
+
+        # 2. Los que están entre 1ro y 5to suben un nivel
+        db.session.query(Alumno).filter(
+            Alumno.id_generacion == id_gen,
+            Alumno.semestre_actual < 6,
+            Alumno.estatus == 'ACTIVO'
+        ).update({Alumno.semestre_actual: Alumno.semestre_actual + 1}, synchronize_session=False)
+
+        db.session.commit()
+        return jsonify({"message": "Promoción completada exitosamente"}), 200
+
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({"error": str(e)}), 500 
+# ==========================
+# PROMOCIÓN SELECTIVA
+# ==========================
+@app.route("/alumnos/promocion-selectiva", methods=["POST"])
+def promocion_selectiva():
+    data = request.get_json()
+    ids_alumnos = data.get("ids_alumnos", [])
+    # ✅ Ahora recibimos el semestre al que quieres enviarlos
+    semestre_destino = data.get("semestre_destino")
+    
+    if not ids_alumnos or not semestre_destino:
+        return jsonify({"error": "Faltan alumnos o semestre de destino"}), 400
+
+    try:
+        # 1. Si el destino es 7 o más, los graduamos
+        if int(semestre_destino) > 6:
+            db.session.query(Alumno).filter(Alumno.id_alumno.in_(ids_alumnos))\
+                .update({Alumno.estatus: 'EGRESADO', Alumno.semestre_actual: 6}, synchronize_session=False)
+        else:
+            # 2. Los movemos al semestre exacto que seleccionó la secretaria
+            db.session.query(Alumno).filter(Alumno.id_alumno.in_(ids_alumnos))\
+                .update({Alumno.semestre_actual: int(semestre_destino)}, synchronize_session=False)
+
+        db.session.commit()
+        return jsonify({"message": f"Promoción a {semestre_destino}° exitosa"}), 200
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({"error": str(e)}), 500
+# ==========================================
+# 🗑️ ELIMINAR ALUMNO (CON LIMPIEZA DE DATOS)
+# ==========================================
+@app.route("/alumnos/<string:matricula>", methods=["DELETE"])
+def eliminar_alumno(matricula):
+    alumno = Alumno.query.filter_by(matricula=matricula).first()
+    
+    if not alumno:
+        return jsonify({"error": "El alumno no existe"}), 404
+
+    try:
+        # 1. Eliminar registros de pagos vinculados (para evitar errores de FK)
+        Pago.query.filter_by(id_alumno=alumno.id_alumno).delete()
+        
+        # 2. Identificar al usuario vinculado
+        id_usuario_vinculado = alumno.id_usuario
+        
+        # 3. Eliminar al alumno
+        db.session.delete(alumno)
+        db.session.flush() # Sincroniza sin confirmar todavía
+        
+        # 4. Eliminar el usuario del portal (opcional, pero recomendado)
+        if id_usuario_vinculado:
+            Usuario.query.filter_by(id_usuario=id_usuario_vinculado).delete()
+
+        db.session.commit()
+        return jsonify({"message": f"Alumno {matricula} y sus datos relacionados han sido eliminados"}), 200
+
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({"error": str(e)}), 500          
 # ==========================
 # ✅ MÓDULO DE GENERACIONES (Actualizado para el ERP)
 # ==========================
