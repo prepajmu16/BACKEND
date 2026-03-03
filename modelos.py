@@ -64,9 +64,11 @@ class Grupo(db.Model):
     turno = db.Column(db.Enum('Matutino','Vespertino'), default='Matutino')
     id_generacion = db.Column(db.Integer, db.ForeignKey('generacion.id_generacion'), nullable=False)
 
+    # ✅ NUEVO: Este candado prohíbe la combinación duplicada de Nombre + Generación
+    __table_args__ = (db.UniqueConstraint('nombre_grupo', 'id_generacion', name='_grupo_gen_uc'),)
+
     generacion = db.relationship('Generacion', back_populates='grupos')
     alumnos = db.relationship('Alumno', back_populates='grupo')
-
 
 # ==============================
 # ALUMNO
@@ -84,11 +86,30 @@ class Alumno(db.Model):
     id_usuario = db.Column(db.Integer, db.ForeignKey('usuario.id_usuario'), unique=True)
     id_grupo = db.Column(db.Integer, db.ForeignKey('grupos.id_grupo'))
 
+    # Relaciones existentes
     generacion = db.relationship('Generacion', back_populates='alumnos')
     usuario = db.relationship('Usuario', back_populates='alumno')
     grupo = db.relationship('Grupo', back_populates='alumnos')
     pagos = db.relationship('Pago', back_populates='alumno')
 
+    # ✅ NUEVO: Este método convierte el objeto de SQLAlchemy en un Diccionario para Angular
+    def to_dict(self):
+        return {
+            "id_alumno": self.id_alumno,
+            "matricula": self.matricula,
+            "nombre": self.nombre,
+            "apellido": self.apellido,
+            "estatus": self.estatus,
+            "id_generacion": self.id_generacion,
+            "id_grupo": self.id_grupo,
+            
+            # 🔗 Accedemos a los nombres reales a través de las relaciones
+            "nombre_gen": self.generacion.nombre if self.generacion else "Sin Generación",
+            "nombre_grupo": self.grupo.nombre_grupo if self.grupo else "Sin Grupo",
+            
+            # 💰 Calculamos el adeudo al vuelo revisando la lista de pagos
+            "tieneAdeudo": any(p.estado == 'PENDIENTE' for p in self.pagos)
+        }
 
 # ==============================
 # ESTRUCTURA DE PAGO

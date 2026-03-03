@@ -9,8 +9,8 @@ from flask_jwt_extended import (
 from werkzeug.security import generate_password_hash, check_password_hash
 from datetime import timedelta
 
-# ✅ IMPORTACIONES ACTUALIZADAS: Agregamos Alumno, EstructuraPago, Pago
-from modelos import db, Generacion, Usuario, Bitacora, Alumno, EstructuraPago, Pago
+# ✅ IMPORTACIONES COMPLETAS
+from modelos import db, Generacion, Usuario, Bitacora, Alumno, EstructuraPago, Pago, Grupo
 from config import config
 
 app = Flask(__name__)
@@ -49,8 +49,6 @@ def login():
     contraseña_entrada = data.get("password")
 
     # 1. Buscamos al usuario 
-    # (Como decidimos que para alumnos el 'correo' guardará la matrícula, 
-    # esta búsqueda funciona para ambos casos sin cambiar nada).
     usuario = Usuario.query.filter_by(correo=identificador).first()
 
     # 2. Verificamos contraseña encriptada
@@ -98,7 +96,6 @@ def registrar_usuario():
 
     password_hash = generate_password_hash(data["contraseña"])
 
-    # Lógica de Puesto (Solo para ADMIN)
     puesto_asignado = data.get("puesto") if data["rol"] == 'ADMIN' else None
 
     nuevo_usuario = Usuario(
@@ -133,27 +130,24 @@ def registrar_usuario():
         return jsonify({"error": str(e)}), 500
 
 # ==========================
-# ✅ NUEVO: MÓDULO DE ALUMNOS (Inscripción)
+# MÓDULO DE ALUMNOS (Inscripción)
 # ==========================
 @app.route("/alumnos", methods=["POST"])
 def registrar_alumno():
     data = request.get_json()
 
-    # Validamos datos (matricula es vital)
     if not all(k in data for k in ("matricula", "nombre", "apellido", "id_generacion")):
         return jsonify({"error": "Faltan datos (matricula, nombre, apellido, id_generacion)"}), 400
 
-    # Validar duplicados
     if Alumno.query.filter_by(matricula=data["matricula"]).first():
         return jsonify({"error": "La matrícula ya existe"}), 400
 
     try:
         # 1. CREAR USUARIO (Login)
-        # Usuario = Matrícula | Contraseña = Matrícula
         nuevo_usuario = Usuario(
             nombre=f"{data['nombre']} {data['apellido']}",
-            correo=data["matricula"], # Guardamos la matrícula en el campo correo
-            contraseña=generate_password_hash(data["matricula"]), # Pass inicial = Matrícula
+            correo=data["matricula"],
+            contraseña=generate_password_hash(data["matricula"]),
             rol='ALUMNO',
             estado='ACTIVO'
         )
@@ -172,7 +166,7 @@ def registrar_alumno():
         db.session.add(nuevo_alumno)
         db.session.flush()
 
-        # 3. GENERAR ADEUDOS (Automático)
+        # 3. GENERAR ADEUDOS
         conceptos = EstructuraPago.query.filter_by(id_generacion=data["id_generacion"]).all()
         
         pagos_creados = 0
@@ -200,35 +194,175 @@ def registrar_alumno():
         return jsonify({"error": str(e)}), 500
 
 # ==========================
-# MÓDULO DE GENERACIONES
+# ✅ MÓDULO DE GENERACIONES (Actualizado para el ERP)
 # ==========================
 @app.route("/generaciones", methods=["POST"])
 def registrar_generacion():
     data = request.get_json()
-    # ... (Tu código de generaciones está bien)
-    nueva_gen = Generacion(
-        nombre=data["nombre"],
-        fecha_inicio=data["fecha_inicio"],
-        fecha_fin=data["fecha_fin"]
-    )
-    db.session.add(nueva_gen)
-    db.session.commit()
-    return jsonify({"message": "Generación creada"}), 201
+    
+    try:
+        nueva_gen = Generacion(
+            nombre=data["nombre"],
+            fecha_inicio=data["fecha_inicio"],
+            fecha_fin=data["fecha_fin"],
+            estado=data.get("estado", "ACTIVA")
+        )
+        db.session.add(nueva_gen)
+        db.session.commit()
+        return jsonify({"message": "Generación creada"}), 201
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({"error": str(e)}), 500
 
 @app.route("/generaciones", methods=["GET"])
 def listar_generaciones():
     generaciones = Generacion.query.all()
     resultado = []
+    
     for g in generaciones:
+        # ✅ Magia de SQL y Python: Contamos activos y bajas leyendo la relación g.alumnos
+        activos = sum(1 for a in g.alumnos if a.estatus == 'ACTIVO')
+        bajas = sum(1 for a in g.alumnos if a.estatus in ['BAJA', 'SUSPENDIDO'])
+        
         resultado.append({
             "id": g.id_generacion,
             "nombre": g.nombre,
             "fecha_inicio": g.fecha_inicio.strftime("%Y-%m-%d"),
             "fecha_fin": g.fecha_fin.strftime("%Y-%m-%d"),
-            "estado": g.estado
+            "estado": g.estado,
+            "activos": activos,  # Enviamos los contadores a Angular
+            "bajas": bajas
         })
     return jsonify(resultado), 200
 
+# ✅ NUEVO: Ruta PUT para editar y cambiar estado ("Apagar" Generación)
+@app.route("/generaciones/<int:id_generacion>", methods=["PUT"])
+def actualizar_generacion(id_generacion):
+    data = request.get_json()
+    
+    generacion = Generacion.query.get(id_generacion)
+    if not generacion:
+        return jsonify({"error": "Generación no encontrada"}), 404
+
+    try:
+        # Actualizamos solo los datos que vengan en el request
+        if "nombre" in data:
+            generacion.nombre = data["nombre"]
+        if "fecha_inicio" in data:
+            generacion.fecha_inicio = data["fecha_inicio"]
+        if "fecha_fin" in data:
+            generacion.fecha_fin = data["fecha_fin"]
+        if "estado" in data:
+            generacion.estado = data["estado"]
+
+        db.session.commit()
+        return jsonify({"message": "Generación actualizada correctamente"}), 200
+
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({"error": str(e)}), 500
+
+
+# ==========================
+# MÓDULO DASHBOARD
+# ==========================
+@app.route('/api/dashboard/admin', methods=['GET'])
+def obtener_datos_dashboard():
+    alumnos = Alumno.query.all()
+    generaciones = Generacion.query.all()
+    grupos = Grupo.query.all()
+
+    return jsonify({
+        "alumnos": [a.to_dict() for a in alumnos], 
+        "generaciones": [{"id": g.id_generacion, "nombre": g.nombre} for g in generaciones],
+        "grupos": [{"id": gr.id_grupo, "nombre": gr.nombre_grupo} for gr in grupos]
+    })   
+
+# ==========================
+# MÓDULO DE GRUPOS
+# ==========================
+@app.route("/grupos", methods=["POST"])
+def registrar_grupo():
+    data = request.get_json()
+    
+    try:
+        # 🛡️ VALIDACIÓN: ¿Ya existe el mismo nombre en la misma generación?
+        id_gen = int(data["id_generacion"])
+        nombre = data["nombre_grupo"].upper() # Lo pasamos a mayúsculas para evitar 'a' vs 'A'
+
+        existe = Grupo.query.filter_by(nombre_grupo=nombre, id_generacion=id_gen).first()
+        
+        if existe:
+            return jsonify({
+                "error": f"El Grupo {nombre} ya está registrado para esta generación."
+            }), 400
+
+        nuevo_grupo = Grupo(
+            nombre_grupo=nombre,
+            turno=data.get("turno", "Vespertino"), # Forzamos Vespertino por defecto
+            id_generacion=id_gen
+        )
+        db.session.add(nuevo_grupo)
+        db.session.commit()
+        return jsonify({"message": "Grupo creado exitosamente"}), 201
+        
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({"error": str(e)}), 500
+
+@app.route("/grupos", methods=["GET"])
+def listar_grupos():
+    grupos = Grupo.query.all()
+    resultado = []
+    
+    for g in grupos:
+        activos = sum(1 for a in g.alumnos if a.estatus == 'ACTIVO')
+        resultado.append({
+            "id_grupo": g.id_grupo,
+            "nombre_grupo": g.nombre_grupo,
+            "turno": g.turno,
+            "id_generacion": g.id_generacion,
+            "nombre_gen": g.generacion.nombre if g.generacion else "Sin Generación",
+            "total_alumnos": activos
+        })
+    return jsonify(resultado), 200
+
+@app.route("/grupos/<int:id_grupo>", methods=["PUT"])
+def actualizar_grupo(id_grupo):
+    data = request.get_json()
+    grupo = Grupo.query.get(id_grupo)
+    
+    if not grupo:
+        return jsonify({"error": "Grupo no encontrado"}), 404
+    
+    try:
+        # 🛡️ VALIDACIÓN EN EDICIÓN: Evitar duplicados al renombrar
+        nuevo_nombre = data.get("nombre_grupo", grupo.nombre_grupo).upper()
+        nueva_gen = int(data.get("id_generacion", grupo.id_generacion))
+
+        # Buscamos si hay OTRO grupo (diferente al actual) que ya tenga esos datos
+        existe = Grupo.query.filter(
+            Grupo.id_grupo != id_grupo, 
+            Grupo.nombre_grupo == nuevo_nombre, 
+            Grupo.id_generacion == nueva_gen
+        ).first()
+
+        if existe:
+            return jsonify({
+                "error": f"No puedes actualizar: El Grupo {nuevo_nombre} ya existe en esa generación."
+            }), 400
+
+        grupo.nombre_grupo = nuevo_nombre
+        grupo.turno = data.get("turno", grupo.turno)
+        grupo.id_generacion = nueva_gen
+            
+        db.session.commit()
+        return jsonify({"message": "Grupo actualizado correctamente"}), 200
+        
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({"error": str(e)}), 500
+    
 # ==========================
 # INICIO DE LA APP
 # ==========================
