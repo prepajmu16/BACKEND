@@ -129,6 +129,10 @@ class EstructuraPago(db.Model):
     id_estructura = db.Column(db.Integer, primary_key=True)
     id_generacion = db.Column(db.Integer, db.ForeignKey('generacion.id_generacion'), nullable=False)
     tipo = db.Column(db.Enum('INSCRIPCION','MENSUALIDAD','EEE'), nullable=False)
+    
+    # ✅ NUEVA COLUMNA: Sincronizada con MySQL para poder filtrar en Angular
+    semestre = db.Column(db.Integer, default=1) 
+    
     concepto = db.Column(db.String(100))
     mes = db.Column(db.Integer)
     
@@ -139,7 +143,6 @@ class EstructuraPago(db.Model):
 
     generacion = db.relationship('Generacion', back_populates='estructuras')
     pagos = db.relationship('Pago', back_populates='estructura')
-
 
 # ==============================
 # PAGO

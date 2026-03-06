@@ -9,6 +9,7 @@ from flask_jwt_extended import (
 from werkzeug.security import generate_password_hash, check_password_hash
 from datetime import timedelta
 
+
 # ✅ IMPORTACIONES COMPLETAS
 from modelos import db, Generacion, Usuario, Bitacora, Alumno, EstructuraPago, Pago, Grupo
 from config import config
@@ -132,19 +133,36 @@ def registrar_usuario():
 # ==========================
 # MÓDULO DE ALUMNOS (Inscripción y Listado)
 # ==========================
-
 @app.route("/alumnos", methods=["GET"])
 def listar_alumnos():
     try:
-        # Usamos outerjoin para traer al alumno aunque no tenga grupo asignado (como Carlos)
         alumnos = Alumno.query.all()
-        # El to_dict() que definiste en modelos.py se encarga de los nombres de gen y grupo
-        return jsonify([a.to_dict() for a in alumnos]), 200
+        resultado = []
+        for a in alumnos:
+            nombre_gen = a.generacion.nombre if a.generacion else "Sin Generación"
+            nombre_grupo = a.grupo.nombre_grupo if a.grupo else "Sin Grupo"
+            
+            resultado.append({
+                "id_alumno": a.id_alumno,
+                "matricula": a.matricula,
+                "nombre": a.nombre,          # ✅ AHORA ENVIAMOS EL NOMBRE SEPARADO
+                "apellido": a.apellido,      # ✅ AHORA ENVIAMOS EL APELLIDO SEPARADO
+                "nombre_completo": f"{a.nombre} {a.apellido}",
+                "estatus": a.estatus,
+                "semestre_actual": a.semestre_actual,
+                "id_generacion": a.id_generacion,
+                "nombre_generacion": nombre_gen,
+                "id_grupo": a.id_grupo,
+                "nombre_grupo": nombre_grupo
+            })
+        return jsonify(resultado), 200
     except Exception as e:
+        print("🔴 ERROR EN GET /alumnos:", str(e))
         return jsonify({"error": str(e)}), 500
 
-@app.route("/alumnos", methods=["POST"])
+@app.route("/alumnos", methods=["POST", "OPTIONS"])
 def registrar_alumno():
+    if request.method == "OPTIONS": return jsonify({}), 200
     data = request.get_json()
 
     # Validación básica
@@ -172,157 +190,218 @@ def registrar_alumno():
             nombre=data["nombre"],
             apellido=data["apellido"],
             id_generacion=data["id_generacion"],
-            id_grupo=data["id_grupo"], # Ya permite el ID de los grupos A o B que creamos
+            id_grupo=data["id_grupo"], 
             id_usuario=nuevo_usuario.id_usuario,
-            semestre_actual=1, # ✅ Aseguramos que entre a 1ro para que Angular lo vea
+            semestre_actual=1, 
             estatus='ACTIVO'
         )
         db.session.add(nuevo_alumno)
         db.session.flush()
 
-        # 3. Generar Adeudos automáticos
-        conceptos = EstructuraPago.query.filter_by(id_generacion=data["id_generacion"]).all()
+        # 🛡️ 3. Generar Adeudos automáticos (SOLO SEMESTRE 1)
+        conceptos = EstructuraPago.query.filter(
+            EstructuraPago.id_generacion == data["id_generacion"],
+            EstructuraPago.tipo.in_(['INSCRIPCION', 'MENSUALIDAD']),
+            EstructuraPago.semestre == 1  
+        ).all()
+        
         for c in conceptos:
-            pago = Pago(
-                id_alumno=nuevo_alumno.id_alumno,
-                id_estructura=c.id_estructura,
-                estado='PENDIENTE',
-                numero_oportunidad=1
-            )
-            db.session.add(pago)
+            if c.concepto.upper().startswith('INSCRIP') or c.concepto.upper().startswith('MENS'):
+                pago = Pago(
+                    id_alumno=nuevo_alumno.id_alumno,
+                    id_estructura=c.id_estructura,
+                    estado='PENDIENTE',
+                    numero_oportunidad=1
+                )
+                db.session.add(pago)
 
         db.session.commit()
         return jsonify({"message": "Inscripción exitosa", "usuario": data["matricula"]}), 201
 
     except Exception as e:
         db.session.rollback()
+        print("🔴 ERROR EN POST /alumnos:", str(e))
         return jsonify({"error": str(e)}), 500
-    
-@app.route("/alumnos/<string:matricula>", methods=["PUT"])
-def actualizar_estatus_alumno(matricula):
-    data = request.get_json()
-    alumno = Alumno.query.filter_by(matricula=matricula).first()
 
-    if not alumno:
-        return jsonify({"error": "Alumno no encontrado"}), 404
+# ==========================================
+# ✏️ ACTUALIZAR ALUMNO (Con Auto-Generación de Deuda)
+# ==========================================
+@app.route("/alumnos/<string:matricula_original>", methods=["PUT", "OPTIONS"])
+def actualizar_estatus_alumno(matricula_original):
+    if request.method == "OPTIONS": return jsonify({}), 200
+    data = request.get_json()
+    
+    # 1. Buscamos al alumno
+    alumno = Alumno.query.filter_by(matricula=matricula_original).first()
+    if not alumno: return jsonify({"error": "Alumno no encontrado"}), 404
 
     try:
-        # Actualizamos solo lo que venga en el JSON
-        if "estatus" in data:
-            alumno.estatus = data["estatus"]
+        # 2. Si cambiaron la matrícula (con su respectiva validación)
+        nueva_matricula = data.get("matricula")
+        if nueva_matricula and nueva_matricula != matricula_original:
+            existe = Alumno.query.filter_by(matricula=nueva_matricula).first()
+            if existe: return jsonify({"error": "La nueva matrícula ya está en uso"}), 400
+            
+            if alumno.id_usuario:
+                usuario = Usuario.query.get(alumno.id_usuario)
+                if usuario: usuario.correo = nueva_matricula
+            alumno.matricula = nueva_matricula
+
+        # 3. Datos Personales y Estatus
+        if "nombre" in data: alumno.nombre = data["nombre"]
+        if "apellido" in data: alumno.apellido = data["apellido"]
+        if "estatus" in data: alumno.estatus = data["estatus"]
+        if "id_grupo" in data: alumno.id_grupo = data["id_grupo"]
+
+        # 🔥 4. LA MAGIA: Si cambian el Semestre desde el Lapicito
         if "semestre_actual" in data:
-            alumno.semestre_actual = int(data["semestre_actual"])
-        if "id_grupo" in data:
-            alumno.id_grupo = data["id_grupo"]
+            nuevo_semestre = int(data["semestre_actual"])
+            
+            # Verificamos si realmente lo movieron a un semestre distinto
+            if nuevo_semestre != alumno.semestre_actual:
+                alumno.semestre_actual = nuevo_semestre # Guardamos el nuevo número
+                
+                # Buscamos los cobros oficiales de ese nuevo semestre
+                conceptos = EstructuraPago.query.filter(
+                    EstructuraPago.id_generacion == alumno.id_generacion,
+                    EstructuraPago.semestre == nuevo_semestre,
+                    EstructuraPago.tipo.in_(['INSCRIPCION', 'MENSUALIDAD'])
+                ).all()
+
+                for c in conceptos:
+                    # Candado: Evitamos duplicados por si ya se los habíamos generado antes
+                    existe_pago = Pago.query.filter_by(id_alumno=alumno.id_alumno, id_estructura=c.id_estructura).first()
+                    if not existe_pago:
+                        db.session.add(Pago(
+                            id_alumno=alumno.id_alumno,
+                            id_estructura=c.id_estructura,
+                            estado='PENDIENTE'
+                        ))
 
         db.session.commit()
-
-        # Opcional: Registrar el movimiento en bitácora
-        nueva_bitacora = Bitacora(
-            id_usuario=1, 
-            accion="ACTUALIZAR_TRAYECTORIA",
-            descripcion=f"Alumno {matricula} movido a {alumno.estatus} en Semestre {alumno.semestre_actual}"
-        )
-        db.session.add(nueva_bitacora)
-        db.session.commit()
-
-        return jsonify({"message": "Trayectoria actualizada correctamente"}), 200
-
+        return jsonify({"message": "Datos actualizados y cobros verificados"}), 200
     except Exception as e:
         db.session.rollback()
-        return jsonify({"error": str(e)}), 500  
-    
-# ✅ Asegúrate de incluir methods=["POST"]
-@app.route("/alumnos/promocion-masiva", methods=["POST"])
+        return jsonify({"error": str(e)}), 500
+# ==========================
+# 🚀 PROMOCIÓN MASIVA (Con Auto-Generación de Deuda)
+# ==========================
+@app.route("/alumnos/promocion-masiva", methods=["POST", "OPTIONS"])
 def promocion_masiva():
+    if request.method == "OPTIONS": return jsonify({}), 200
     data = request.get_json()
     id_gen = data.get("id_generacion")
     
-    if not id_gen:
-        return jsonify({"error": "Debes especificar la generación"}), 400
+    if not id_gen: return jsonify({"error": "Debes especificar la generación"}), 400
 
     try:
-        # 1. Los que están en 6to semestre pasan a ser 'EGRESADO'
+        # 1. Los que están en 6to semestre pasan a 'EGRESADO'
         db.session.query(Alumno).filter(
-            Alumno.id_generacion == id_gen,
-            Alumno.semestre_actual == 6,
-            Alumno.estatus == 'ACTIVO'
+            Alumno.id_generacion == id_gen, Alumno.semestre_actual == 6, Alumno.estatus == 'ACTIVO'
         ).update({Alumno.estatus: 'EGRESADO'}, synchronize_session=False)
 
-        # 2. Los que están entre 1ro y 5to suben un nivel
-        db.session.query(Alumno).filter(
-            Alumno.id_generacion == id_gen,
-            Alumno.semestre_actual < 6,
-            Alumno.estatus == 'ACTIVO'
-        ).update({Alumno.semestre_actual: Alumno.semestre_actual + 1}, synchronize_session=False)
+        # 2. Obtenemos a los alumnos que van a subir de semestre (1ro a 5to)
+        alumnos_a_promover = Alumno.query.filter(
+            Alumno.id_generacion == id_gen, Alumno.semestre_actual < 6, Alumno.estatus == 'ACTIVO'
+        ).all()
+
+        for alumno in alumnos_a_promover:
+            nuevo_semestre = alumno.semestre_actual + 1
+            alumno.semestre_actual = nuevo_semestre # Le subimos el nivel
+
+            # 🔥 3. MAGIA: Buscamos el paquete de cobros de su NUEVO semestre
+            conceptos = EstructuraPago.query.filter(
+                EstructuraPago.id_generacion == id_gen,
+                EstructuraPago.semestre == nuevo_semestre,
+                EstructuraPago.tipo.in_(['INSCRIPCION', 'MENSUALIDAD'])
+            ).all()
+
+            for c in conceptos:
+                # Verificamos que no se lo hayamos cobrado antes (Evita duplicados si le das 2 veces al botón)
+                existe = Pago.query.filter_by(id_alumno=alumno.id_alumno, id_estructura=c.id_estructura).first()
+                if not existe:
+                    db.session.add(Pago(
+                        id_alumno=alumno.id_alumno,
+                        id_estructura=c.id_estructura,
+                        estado='PENDIENTE'
+                    ))
 
         db.session.commit()
-        return jsonify({"message": "Promoción completada exitosamente"}), 200
+        return jsonify({"message": "Promoción completada y nuevos cobros generados"}), 200
 
     except Exception as e:
         db.session.rollback()
         return jsonify({"error": str(e)}), 500 
+
 # ==========================
-# PROMOCIÓN SELECTIVA
+# 🎯 PROMOCIÓN SELECTIVA (Con Auto-Generación de Deuda)
 # ==========================
-@app.route("/alumnos/promocion-selectiva", methods=["POST"])
+@app.route("/alumnos/promocion-selectiva", methods=["POST", "OPTIONS"])
 def promocion_selectiva():
+    if request.method == "OPTIONS": return jsonify({}), 200
     data = request.get_json()
     ids_alumnos = data.get("ids_alumnos", [])
-    # ✅ Ahora recibimos el semestre al que quieres enviarlos
-    semestre_destino = data.get("semestre_destino")
+    semestre_destino = int(data.get("semestre_destino"))
     
     if not ids_alumnos or not semestre_destino:
         return jsonify({"error": "Faltan alumnos o semestre de destino"}), 400
 
     try:
-        # 1. Si el destino es 7 o más, los graduamos
-        if int(semestre_destino) > 6:
+        if semestre_destino > 6:
             db.session.query(Alumno).filter(Alumno.id_alumno.in_(ids_alumnos))\
                 .update({Alumno.estatus: 'EGRESADO', Alumno.semestre_actual: 6}, synchronize_session=False)
         else:
-            # 2. Los movemos al semestre exacto que seleccionó la secretaria
+            # 1. Movemos a los alumnos al semestre elegido
             db.session.query(Alumno).filter(Alumno.id_alumno.in_(ids_alumnos))\
-                .update({Alumno.semestre_actual: int(semestre_destino)}, synchronize_session=False)
+                .update({Alumno.semestre_actual: semestre_destino}, synchronize_session=False)
+
+            # 🔥 2. MAGIA: Les asignamos la deuda del semestre al que acaban de llegar
+            for id_alum in ids_alumnos:
+                alumno = Alumno.query.get(id_alum)
+                conceptos = EstructuraPago.query.filter(
+                    EstructuraPago.id_generacion == alumno.id_generacion,
+                    EstructuraPago.semestre == semestre_destino,
+                    EstructuraPago.tipo.in_(['INSCRIPCION', 'MENSUALIDAD'])
+                ).all()
+
+                for c in conceptos:
+                    existe = Pago.query.filter_by(id_alumno=id_alum, id_estructura=c.id_estructura).first()
+                    if not existe:
+                        db.session.add(Pago(
+                            id_alumno=id_alum,
+                            id_estructura=c.id_estructura,
+                            estado='PENDIENTE'
+                        ))
 
         db.session.commit()
-        return jsonify({"message": f"Promoción a {semestre_destino}° exitosa"}), 200
+        return jsonify({"message": f"Promoción a {semestre_destino}° exitosa y cobros generados"}), 200
     except Exception as e:
         db.session.rollback()
         return jsonify({"error": str(e)}), 500
-# ==========================================
-# 🗑️ ELIMINAR ALUMNO (CON LIMPIEZA DE DATOS)
-# ==========================================
-@app.route("/alumnos/<string:matricula>", methods=["DELETE"])
+
+@app.route("/alumnos/<string:matricula>", methods=["DELETE", "OPTIONS"])
 def eliminar_alumno(matricula):
+    if request.method == "OPTIONS": return jsonify({}), 200
     alumno = Alumno.query.filter_by(matricula=matricula).first()
     
-    if not alumno:
-        return jsonify({"error": "El alumno no existe"}), 404
+    if not alumno: return jsonify({"error": "El alumno no existe"}), 404
 
     try:
-        # 1. Eliminar registros de pagos vinculados (para evitar errores de FK)
         Pago.query.filter_by(id_alumno=alumno.id_alumno).delete()
-        
-        # 2. Identificar al usuario vinculado
         id_usuario_vinculado = alumno.id_usuario
-        
-        # 3. Eliminar al alumno
         db.session.delete(alumno)
-        db.session.flush() # Sincroniza sin confirmar todavía
-        
-        # 4. Eliminar el usuario del portal (opcional, pero recomendado)
+        db.session.flush() 
         if id_usuario_vinculado:
             Usuario.query.filter_by(id_usuario=id_usuario_vinculado).delete()
 
         db.session.commit()
-        return jsonify({"message": f"Alumno {matricula} y sus datos relacionados han sido eliminados"}), 200
+        return jsonify({"message": f"Alumno {matricula} eliminado"}), 200
 
     except Exception as e:
         db.session.rollback()
-        return jsonify({"error": str(e)}), 500          
+        return jsonify({"error": str(e)}), 500
 # ==========================
-# ✅ MÓDULO DE GENERACIONES (Actualizado para el ERP)
+# ✅ MÓDULO DE GENERACIONES (Con Meses Reales)
 # ==========================
 @app.route("/generaciones", methods=["POST"])
 def registrar_generacion():
@@ -336,34 +415,65 @@ def registrar_generacion():
             estado=data.get("estado", "ACTIVA")
         )
         db.session.add(nueva_gen)
+        db.session.flush() 
+
+        # 🔥 Listas de meses según el calendario escolar
+        meses_impares = ["AGOSTO", "SEPTIEMBRE", "OCTUBRE", "NOVIEMBRE", "DICIEMBRE"]
+        meses_pares = ["ENERO", "FEBRERO", "MARZO", "ABRIL", "MAYO", "JUNIO", "JULIO"]
+
+        for sem in range(1, 7):
+            # 1. Creamos la Inscripción
+            db.session.add(EstructuraPago(
+                id_generacion=nueva_gen.id_generacion, tipo='INSCRIPCION', semestre=sem,
+                concepto=f'INSCRIPCIÓN {sem}° SEMESTRE', monto=3000
+            ))
+
+            # 2. Creamos las mensualidades con sus nombres reales
+            meses_a_usar = meses_impares if sem % 2 != 0 else meses_pares
+            
+            for mes in meses_a_usar:
+                db.session.add(EstructuraPago(
+                    id_generacion=nueva_gen.id_generacion, tipo='MENSUALIDAD', semestre=sem,
+                    concepto=f'MENSUALIDAD {mes} - {sem}° SEM', monto=1500
+                ))
+
         db.session.commit()
-        return jsonify({"message": "Generación creada"}), 201
+        return jsonify({"message": "Generación y esquema de pagos base creados"}), 201
+
     except Exception as e:
         db.session.rollback()
         return jsonify({"error": str(e)}), 500
-
-@app.route("/generaciones", methods=["GET"])
+    
+# ==========================
+# 📋 LISTAR GENERACIONES (A prueba de fechas nulas)
+# ==========================
+@app.route("/generaciones", methods=["GET", "OPTIONS"])
 def listar_generaciones():
+    if request.method == "OPTIONS": return jsonify({}), 200
     generaciones = Generacion.query.all()
     resultado = []
     
     for g in generaciones:
-        # ✅ Magia de SQL y Python: Contamos activos y bajas leyendo la relación g.alumnos
+        # Contamos activos y bajas leyendo la relación g.alumnos
         activos = sum(1 for a in g.alumnos if a.estatus == 'ACTIVO')
         bajas = sum(1 for a in g.alumnos if a.estatus in ['BAJA', 'SUSPENDIDO'])
+        
+        # 🔥 MAGIA: Validamos que la fecha exista antes de intentar formatearla
+        fecha_ini_str = g.fecha_inicio.strftime("%Y-%m-%d") if g.fecha_inicio else ""
+        fecha_fin_str = g.fecha_fin.strftime("%Y-%m-%d") if g.fecha_fin else ""
         
         resultado.append({
             "id": g.id_generacion,
             "nombre": g.nombre,
-            "fecha_inicio": g.fecha_inicio.strftime("%Y-%m-%d"),
-            "fecha_fin": g.fecha_fin.strftime("%Y-%m-%d"),
+            "fecha_inicio": fecha_ini_str,  # Usamos la variable segura
+            "fecha_fin": fecha_fin_str,     # Usamos la variable segura
             "estado": g.estado,
-            "activos": activos,  # Enviamos los contadores a Angular
+            "activos": activos, 
             "bajas": bajas
         })
     return jsonify(resultado), 200
 
-# ✅ NUEVO: Ruta PUT para editar y cambiar estado ("Apagar" Generación)
+# ✅ Ruta PUT para editar y cambiar estado ("Apagar" Generación)
 @app.route("/generaciones/<int:id_generacion>", methods=["PUT"])
 def actualizar_generacion(id_generacion):
     data = request.get_json()
@@ -389,7 +499,6 @@ def actualizar_generacion(id_generacion):
     except Exception as e:
         db.session.rollback()
         return jsonify({"error": str(e)}), 500
-
 
 # ==========================
 # MÓDULO DASHBOARD
@@ -490,7 +599,325 @@ def actualizar_grupo(id_grupo):
     except Exception as e:
         db.session.rollback()
         return jsonify({"error": str(e)}), 500
+# ==========================================
+# 💰 MÓDULO FINANCIERO: ESTRUCTURA DE PAGOS
+# ==========================================
+
+@app.route("/estructura-pagos/<int:id_generacion>", methods=["GET"])
+def obtener_estructura(id_generacion):
+    try:
+        # Buscamos todos los cobros programados para una generación específica
+        conceptos = EstructuraPago.query.filter_by(id_generacion=id_generacion).all()
+        resultado = []
+        for c in conceptos:
+            resultado.append({
+                "id_estructura": c.id_estructura,
+                "concepto": c.concepto,
+                "monto": float(c.monto),
+                "fecha_vencimiento": c.fecha_vencimiento.strftime("%Y-%m-%d") if c.fecha_vencimiento else None,
+                "semestre_aplicable": c.semestre_aplicable
+            })
+        return jsonify(resultado), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route("/estructura-pagos", methods=["POST"])
+def crear_concepto():
+    data = request.get_json()
     
+    campos_requeridos = ("id_generacion", "concepto", "monto", "semestre_aplicable", "fecha_vencimiento")
+    if not all(k in data for k in campos_requeridos):
+        return jsonify({"error": "Faltan datos obligatorios"}), 400
+
+    try:
+        nuevo_concepto = EstructuraPago(
+            id_generacion=data["id_generacion"],
+            concepto=data["concepto"].upper(),
+            monto=data["monto"],
+            fecha_vencimiento=data["fecha_vencimiento"],
+            semestre_aplicable=data["semestre_aplicable"]
+        )
+        db.session.add(nuevo_concepto)
+        db.session.commit()
+        return jsonify({"message": "Concepto de pago creado exitosamente"}), 201
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({"error": str(e)}), 500
+
+@app.route("/estructura-pagos/<int:id_estructura>", methods=["DELETE"])
+def eliminar_concepto(id_estructura):
+    concepto = EstructuraPago.query.get(id_estructura)
+    if not concepto:
+        return jsonify({"error": "Concepto no encontrado"}), 404
+        
+    try:
+        db.session.delete(concepto)
+        db.session.commit()
+        return jsonify({"message": "Concepto eliminado correctamente"}), 200
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({"error": "No se puede eliminar porque ya hay recibos cobrados con este concepto."}), 500    
+# ==========================================
+# 💵 MÓDULO DE CAJA (PUNTO DE COBRO)
+# ==========================================
+
+@app.route("/caja/deudas/<string:matricula>", methods=["GET"])
+def obtener_deudas(matricula):
+    try:
+        alumno = Alumno.query.filter_by(matricula=matricula).first()
+        if not alumno:
+            return jsonify({"error": "Alumno no encontrado"}), 404
+
+        # Simulamos la consulta a una tabla de 'deudas' o 'recibos' pendientes
+        # Ajusta esto según cómo se llame tu tabla de pagos en MySQL
+        pagos_pendientes = Pago.query.filter_by(id_alumno=alumno.id_alumno, estatus_pago='PENDIENTE').all()
+        
+        deudas = []
+        for p in pagos_pendientes:
+            deudas.append({
+                "id_pago": p.id_pago,
+                "concepto": p.concepto,
+                "monto": float(p.monto_total),
+                "fecha_limite": p.fecha_limite.strftime("%Y-%m-%d") if p.fecha_limite else None
+            })
+
+        return jsonify({
+            "alumno": {
+                "nombre_completo": f"{alumno.nombre} {alumno.apellido}",
+                "grupo": alumno.id_grupo,
+                "estatus": alumno.estatus
+            },
+            "deudas": deudas
+        }), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+    
+
+# ==========================================
+# 💵 MÓDULO DE CAJA: LISTADO DE COBRO Y CAJA
+# ==========================================
+@app.route("/caja/alumnos", methods=["GET"])
+def obtener_alumnos_caja():
+    id_gen = request.args.get('generacion')
+    if not id_gen or id_gen == '0':
+        return jsonify({"error": "Debes seleccionar una generación"}), 400
+
+    try:
+        alumnos = Alumno.query.filter_by(id_generacion=id_gen).all()
+        resultado = []
+        for a in alumnos:
+            mensualidades = db.session.query(Pago).join(EstructuraPago).filter(
+                Pago.id_alumno == a.id_alumno,
+                Pago.estado == 'PENDIENTE',
+                EstructuraPago.concepto.like('%MENSUALIDAD%')
+            ).count()
+
+            extraordinarios = db.session.query(Pago).join(EstructuraPago).filter(
+                Pago.id_alumno == a.id_alumno,
+                Pago.estado == 'PENDIENTE',
+                EstructuraPago.concepto.like('%EEE%')
+            ).count()
+
+            # 🔥 LA SOLUCIÓN: Buscamos el nombre del grupo usando la relación de BD
+            nombre_del_grupo = a.grupo.nombre_grupo if a.grupo else "S/G"
+
+            resultado.append({
+                "nombre": f"{a.nombre} {a.apellido}",
+                "matricula": a.matricula,
+                "generacion": a.id_generacion,
+                "grupo": nombre_del_grupo, # <--- AHORA MANDAMOS LA LETRA ("A", "B", etc.)
+                "tiene_adeudo": (mensualidades + extraordinarios) > 0,
+                "m_pendientes": mensualidades,
+                "eee_pendientes": extraordinarios
+            })
+
+        return jsonify(resultado), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+    
+import traceback
+
+# ==========================================
+# 📊 API: OBTENER HISTORIAL DE PAGOS (Ajuste para fecha cruda)
+# ==========================================
+@app.route("/caja/historial/<string:matricula>", methods=["GET", "OPTIONS"])
+def historial_pagos(matricula):
+    if request.method == "OPTIONS": return jsonify({}), 200
+    try:
+        alumno = Alumno.query.filter_by(matricula=matricula).first()
+        if not alumno: return jsonify({"error": "Alumno no encontrado"}), 404
+
+        historial = db.session.query(Pago, EstructuraPago).filter(
+            Pago.id_estructura == EstructuraPago.id_estructura, Pago.id_alumno == alumno.id_alumno
+        ).all()
+        
+        resultado = []
+        for p, e in historial:
+            categoria_str = e.tipo.value if hasattr(e.tipo, 'value') else str(e.tipo)
+            estado_str = p.estado.value if hasattr(p.estado, 'value') else str(p.estado)
+            
+            # Formatos de fecha (uno para la vista, uno para el input de editar)
+            fecha_formateada = p.fecha_pago.strftime("%d/%m/%Y") if p.fecha_pago else None
+            fecha_raw = p.fecha_pago.strftime("%Y-%m-%d") if p.fecha_pago else None
+
+            resultado.append({
+                "id": p.id_pago, "concepto": e.concepto, "monto": float(e.monto) if e.monto is not None else 0.0,
+                "semestre": e.semestre, "categoria": categoria_str.split('.')[-1], 
+                "pagado": estado_str.split('.')[-1] == 'PAGADO',
+                "fecha_pago": fecha_formateada, "fecha_raw": fecha_raw, "folio": p.folio # ✅ Agregamos fecha_raw
+            })
+        return jsonify(resultado), 200
+    except Exception as err:
+        return jsonify({"error": str(err)}), 500
+
+
+# ==========================================
+# 🔄 API: REVERTIR PAGO (APAGAR BOTÓN)
+# ==========================================
+@app.route("/caja/revertir/<int:id_pago>", methods=["PUT", "OPTIONS"])
+def revertir_pago(id_pago):
+    if request.method == "OPTIONS": return jsonify({}), 200
+    try:
+        pago = Pago.query.get(id_pago)
+        if not pago: return jsonify({"error": "Pago no encontrado"}), 404
+
+        # Regresamos el estado a pendiente y borramos fecha/folio
+        if hasattr(pago, 'estatus_pago'): pago.estatus_pago = 'PENDIENTE'
+        else: pago.estado = 'PENDIENTE'
+        
+        pago.fecha_pago = None
+        pago.folio = None
+
+        db.session.commit()
+        return jsonify({"message": "Pago cancelado exitosamente"}), 200
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({"error": str(e)}), 500
+# ==========================================
+# 💸 API: REGISTRAR UN PAGO FÍSICO (Asentar Folio)
+# ==========================================
+@app.route("/caja/registrar", methods=["POST", "OPTIONS"])
+def registrar_cobro_oficial():
+    if request.method == "OPTIONS": 
+        return jsonify({}), 200
+        
+    data = request.get_json()
+    id_pago = data.get("id_pago")
+    fecha_ingresada = data.get("fecha")
+    folio_ingresado = data.get("folio")
+
+    try:
+        pago = Pago.query.get(id_pago)
+        if not pago:
+            return jsonify({"error": "Recibo no encontrado"}), 404
+
+        # Cambiamos el estado a PAGADO
+        if hasattr(pago, 'estatus_pago'):
+            pago.estatus_pago = 'PAGADO'
+        else:
+            pago.estado = 'PAGADO'
+            
+        # Asignamos la fecha y folio que escribió la secretaria
+        pago.fecha_pago = fecha_ingresada 
+        pago.folio = folio_ingresado
+        
+        db.session.commit()
+        return jsonify({"message": "Cobro asentado correctamente"}), 200
+
+    except Exception as e:
+        db.session.rollback()
+        print("🔴 ERROR EN POST /registrar:", str(e))
+        return jsonify({"error": str(e)}), 500
+
+# ==========================================
+# ➕ API: CREAR UN COBRO DESDE EL MODAL
+# ==========================================
+@app.route("/caja/crear", methods=["POST", "OPTIONS"])
+def crear_pago_manual():
+    if request.method == "OPTIONS": 
+        return jsonify({}), 200
+
+    data = request.get_json()
+    try:
+        alumno = Alumno.query.filter_by(matricula=data['matricula']).first()
+        if not alumno:
+            return jsonify({"error": "Alumno no encontrado"}), 404
+        
+        tipo_recibido = data.get('categoria') or data.get('tipo')
+        if not tipo_recibido:
+            return jsonify({"error": "Falta el tipo de cobro"}), 400
+
+        nueva_estructura = EstructuraPago(
+            id_generacion=alumno.id_generacion,
+            tipo=tipo_recibido,
+            semestre=data.get('semestre', 1),
+            concepto=data['concepto'].upper(),
+            monto=data['monto']
+        )
+        db.session.add(nueva_estructura)
+        db.session.flush()
+
+        nuevo_pago = Pago(
+            id_alumno=alumno.id_alumno, 
+            id_estructura=nueva_estructura.id_estructura,
+            estado='PENDIENTE' 
+        )
+
+        db.session.add(nuevo_pago)
+        db.session.commit()
+        
+        return jsonify({"message": "Cobro registrado correctamente"}), 201
+
+    except Exception as err:
+        db.session.rollback()
+        print("🔴 ERROR EN POST /crear:", str(err))
+        return jsonify({"error": str(err)}), 500
+    
+# ==========================================
+# ✏️ API: EDITAR CUALQUIER DATO DE UN COBRO
+# ==========================================
+@app.route("/caja/pago/<int:id_pago>", methods=["PUT", "OPTIONS"])
+def editar_pago(id_pago):
+    if request.method == "OPTIONS": return jsonify({}), 200
+    data = request.get_json()
+    try:
+        pago = Pago.query.get(id_pago)
+        if not pago: return jsonify({"error": "Pago no encontrado"}), 404
+        
+        # 1. Editar Monto y Concepto
+        estructura = EstructuraPago.query.get(pago.id_estructura)
+        if estructura:
+            estructura.concepto = data.get("concepto", estructura.concepto).upper()
+            estructura.monto = data.get("monto", estructura.monto)
+            
+        # 2. Editar Fecha y Folio (solo si ya estaba pagado)
+        if getattr(pago, 'estado', '') == 'PAGADO' or getattr(pago, 'estatus_pago', '') == 'PAGADO':
+            if "fecha" in data: pago.fecha_pago = data["fecha"]
+            if "folio" in data: pago.folio = data["folio"]
+            
+        db.session.commit()
+        return jsonify({"message": "Cobro actualizado"}), 200
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({"error": str(e)}), 500
+
+# ==========================================
+# 🗑️ API: ELIMINAR UN COBRO PENDIENTE
+# ==========================================
+@app.route("/caja/pago/<int:id_pago>", methods=["DELETE", "OPTIONS"])
+def eliminar_pago(id_pago):
+    if request.method == "OPTIONS": return jsonify({}), 200
+    try:
+        pago = Pago.query.get(id_pago)
+        if not pago: return jsonify({"error": "Pago no encontrado"}), 404
+        
+        # Eliminamos el recibo pendiente del alumno
+        db.session.delete(pago)
+        db.session.commit()
+        return jsonify({"message": "Cobro eliminado correctamente"}), 200
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({"error": str(e)}), 500    
 # ==========================
 # INICIO DE LA APP
 # ==========================
