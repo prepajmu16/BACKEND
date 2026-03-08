@@ -66,7 +66,8 @@ def login():
             "message": "Bienvenido",
             "token": access_token,
             "rol": usuario.rol,
-            "usuario": usuario.nombre
+            "usuario": usuario.nombre,
+            "correo": usuario.correo
         }), 200
 
     return jsonify({"message": "Usuario/Matrícula o contraseña incorrectos"}), 401
@@ -917,7 +918,85 @@ def eliminar_pago(id_pago):
         return jsonify({"message": "Cobro eliminado correctamente"}), 200
     except Exception as e:
         db.session.rollback()
-        return jsonify({"error": str(e)}), 500    
+        return jsonify({"error": str(e)}), 500
+    
+# ==========================================
+# 🔐 API: ACTUALIZAR CONTRASEÑA (Usando SQLAlchemy)
+# ==========================================
+@app.route('/api/actualizar_password', methods=['POST', 'OPTIONS'])
+def actualizar_password():
+    if request.method == "OPTIONS": return jsonify({}), 200
+    
+    try:
+        data = request.get_json()
+        
+        # 1. Recibimos los datos
+        correo = data.get('correoUsuario') 
+        pass_actual = data.get('passActual')
+        pass_nueva = data.get('passNueva')
+
+        if not correo or not pass_actual or not pass_nueva:
+            return jsonify({"status": "error", "mensaje": "Faltan datos por enviar"}), 400
+
+        # 2. Buscamos al usuario usando el modelo SQLAlchemy
+        usuario = Usuario.query.filter_by(correo=correo).first()
+
+        if not usuario:
+            return jsonify({"status": "error", "mensaje": "Usuario no encontrado"}), 404
+        
+        # 3. Verificamos la contraseña actual (Usando el mismo sistema que tienes en tu Login)
+        if not check_password_hash(usuario.contraseña, pass_actual):
+            return jsonify({"status": "error", "mensaje": "La contraseña actual es incorrecta"}), 401
+
+        # 4. Encriptamos y guardamos la nueva contraseña
+        usuario.contraseña = generate_password_hash(pass_nueva)
+        db.session.commit()
+
+        return jsonify({"status": "success", "mensaje": "Contraseña actualizada correctamente"}), 200
+
+    except Exception as e:
+        db.session.rollback()
+        print("Error al actualizar contraseña:", str(e))
+        return jsonify({"status": "error", "mensaje": "Error en el servidor al actualizar"}), 500      
+
+# ==========================================
+# 👤 API: ACTUALIZAR INFORMACIÓN PERSONAL
+# ==========================================
+@app.route('/api/actualizar_perfil', methods=['PUT', 'OPTIONS'])
+def actualizar_perfil():
+    if request.method == "OPTIONS": return jsonify({}), 200
+    
+    try:
+        data = request.get_json()
+        
+        correo_actual = data.get('correoActual') # Para saber a quién buscar
+        nuevo_nombre = data.get('nombre')
+        nuevo_correo = data.get('correo')
+        nuevo_puesto = data.get('puesto')
+
+        # 1. Buscamos al usuario por su correo actual
+        usuario = Usuario.query.filter_by(correo=correo_actual).first()
+        if not usuario:
+            return jsonify({"status": "error", "mensaje": "Usuario no encontrado"}), 404
+
+        # 2. Validamos si el nuevo correo ya lo está usando alguien más
+        if nuevo_correo != correo_actual:
+            existe = Usuario.query.filter_by(correo=nuevo_correo).first()
+            if existe:
+                return jsonify({"status": "error", "mensaje": "El nuevo correo ya está en uso"}), 400
+
+        # 3. Guardamos los nuevos datos
+        usuario.nombre = nuevo_nombre
+        usuario.correo = nuevo_correo
+        if hasattr(usuario, 'puesto') and nuevo_puesto:
+            usuario.puesto = nuevo_puesto
+
+        db.session.commit()
+        return jsonify({"status": "success", "mensaje": "Información personal actualizada"}), 200
+
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({"status": "error", "mensaje": "Error en el servidor al actualizar"}), 500
 # ==========================
 # INICIO DE LA APP
 # ==========================
