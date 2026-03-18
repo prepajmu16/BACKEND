@@ -1,4 +1,4 @@
-from flask_sqlalchemy import SQLAlchemy
+""" from flask_sqlalchemy import SQLAlchemy
 from datetime import datetime, timezone
 
 db = SQLAlchemy()
@@ -180,4 +180,4 @@ class Bitacora(db.Model):
     onupdate=lambda: datetime.now(timezone.utc)
 
     )
-    usuario = db.relationship('Usuario', back_populates='bitacoras')
+    usuario = db.relationship('Usuario', back_populates='bitacoras') """
