@@ -13,6 +13,7 @@ from routes.admin_routes import admin_bp
 from routes.alumno_routes import alumno_bp
 from routes.catalogo_routes import catalogo_bp
 from routes.caja_routes import caja_bp
+from routes.reportes_routes import reportes_bp
 
 app = Flask(__name__)
 
@@ -38,6 +39,7 @@ app.register_blueprint(admin_bp, url_prefix='/api',)
 app.register_blueprint(alumno_bp, url_prefix='/api')
 app.register_blueprint(catalogo_bp, url_prefix='/api')
 app.register_blueprint(caja_bp, url_prefix='/api')
+app.register_blueprint(reportes_bp, url_prefix='/api/reportes')
 
 @app.route("/")
 def home():
