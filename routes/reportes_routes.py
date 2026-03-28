@@ -1,258 +1,426 @@
 from flask import Blueprint, request, jsonify, send_file
 import io
+import os
 import pandas as pd
 import traceback
 from datetime import datetime, date
-from sqlalchemy import func # 🚩 Necesario para sumar el dinero
+from sqlalchemy import func 
 from extensions import db
 from models.pago import Pago
 from models.alumno import Alumno
 from models.estructura_pago import EstructuraPago
 from models.grupo import Grupo 
+from helpers import registrar_accion, obtener_id_admin
+import subprocess
 
-# ReportLab
+# --- EXCEL PRO ---
+from openpyxl.styles import Font, PatternFill, Alignment
+
+# --- PDF PRO ---
 from reportlab.lib.pagesizes import letter
-from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer
+from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer, KeepTogether, Image
 from reportlab.lib.styles import getSampleStyleSheet
 from reportlab.lib import colors
-from reportlab.lib.enums import TA_CENTER # 🚩 Necesario para centrar subtítulos
+from reportlab.lib.enums import TA_LEFT 
 
 reportes_bp = Blueprint('reportes_bp', __name__)
 
-# --- 0. ENDPOINT DEL DASHBOARD (DINERO REAL) ---
-@reportes_bp.route("/dashboard", methods=["GET"])
-def dashboard_ingresos():
+# 🔥 RUTA DEL LOGO
+BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+RUTA_LOGO = os.path.join(BASE_DIR, 'static', 'img', 'LOGO3.png')
+
+print(f"\n--- 🔍 REVISANDO LOGO EN: {RUTA_LOGO} ---")
+if os.path.exists(RUTA_LOGO):
+    print("✅ LOGO ENCONTRADO\n")
+else:
+    print("❌ LOGO NO ENCONTRADO - Revisa la carpeta static/img\n")
+
+def limpiar_param(val):
+    if val in [None, "null", "undefined", "", "Todos", "0"]: return None
+    return val
+
+# --- 1. PIE DE PÁGINA ---
+def pie_de_pagina(canvas, doc):
+    canvas.saveState()
+    estilos = getSampleStyleSheet()
+    texto = f"SISTEMA DE CONTROL DE PAGOS  —  Página {doc.page}"
+    p = Paragraph(f"<font color='grey' size=8>{texto}</font>", estilos['Normal'])
+    p.wrapOn(canvas, letter[0], 50)
+    p.drawOn(canvas, letter[0]/2 - 80, 20)
+    canvas.restoreState()
+
+# --- 2. ENCABEZADO OFICIAL (ALINEACIÓN PERFECTA) ---
+def crear_encabezado_logo(elementos, titulo_reporte, estilos):
     try:
-        hoy_db = date.today()
-        primer_dia_mes = hoy_db.replace(day=1)
+        if os.path.exists(RUTA_LOGO):
+            img = Image(RUTA_LOGO, width=65, height=65) 
+        else:
+            img = ""
+    except: img = ""
 
-        # Sumar ingresos de HOY
-        suma_hoy = db.session.query(func.sum(EstructuraPago.monto)).select_from(Pago)\
-            .join(EstructuraPago, Pago.id_estructura == EstructuraPago.id_estructura)\
-            .filter(Pago.fecha_pago == hoy_db).scalar()
+    estilo_escuela = estilos['Title']
+    estilo_escuela.fontSize = 17
+    estilo_escuela.alignment = TA_LEFT
+    estilo_escuela.leftIndent = 0 
+    estilo_escuela.textColor = colors.HexColor("#0f172a")
+    estilo_escuela.spaceAfter = 2
 
-        # Sumar ingresos del MES
-        suma_mes = db.session.query(func.sum(EstructuraPago.monto)).select_from(Pago)\
-            .join(EstructuraPago, Pago.id_estructura == EstructuraPago.id_estructura)\
-            .filter(Pago.fecha_pago >= primer_dia_mes, Pago.fecha_pago <= hoy_db).scalar()
+    estilo_sistema = estilos['Heading2']
+    estilo_sistema.fontSize = 11
+    estilo_sistema.alignment = TA_LEFT
+    estilo_sistema.leftIndent = 0
+    estilo_sistema.textColor = colors.HexColor("#64748b")
+    estilo_sistema.spaceAfter = 6
 
-        return jsonify({
-            "ingresos_hoy": float(suma_hoy or 0),
-            "ingresos_mes": float(suma_mes or 0)
-        })
-    except Exception:
-        print(traceback.format_exc())
-        return jsonify({"error": "Error al cargar dashboard"}), 500
+    estilo_tipo_reporte = estilos['Normal']
+    estilo_tipo_reporte.fontSize = 12
+    estilo_tipo_reporte.fontName = 'Helvetica-Bold'
+    estilo_tipo_reporte.alignment = TA_LEFT
+    estilo_tipo_reporte.leftIndent = 0
+    estilo_tipo_reporte.textColor = colors.HexColor("#1d4ed8") 
+    estilo_tipo_reporte.spaceAfter = 2
 
-# --- 1. MOTOR DE PDF DETALLADO (PARA DEUDORES) ---
+    estilo_fecha = estilos['Normal']
+    estilo_fecha.fontSize = 9
+    estilo_fecha.leftIndent = 0
+    estilo_fecha.textColor = colors.grey
+
+    data = [[img, [
+        Paragraph("<b>EPC JUAN MIRANDA URESTI N°16</b>", estilo_escuela),
+        Paragraph("SISTEMA DE CONTROL DE PAGOS", estilo_sistema),
+        Paragraph(f"{titulo_reporte}", estilo_tipo_reporte),
+        Paragraph(f"Fecha de reporte: {datetime.now().strftime('%d/%m/%Y %H:%M')}", estilo_fecha)
+    ]]]
+
+    t = Table(data, colWidths=[70, 460])
+    t.setStyle(TableStyle([
+        ('VALIGN', (0,0), (-1,-1), 'MIDDLE'),
+        ('LEFTPADDING', (0,0), (-1,-1), 0),
+        ('RIGHTPADDING', (0,0), (0,0), 0), 
+        ('LINEBELOW', (0,0), (-1,-1), 1.5, colors.HexColor("#1E293B")),
+        ('BOTTOMPADDING', (0,0), (-1,-1), 10),
+    ]))
+    
+    elementos.append(t)
+    elementos.append(Spacer(1, 15))
+
+# --- 3. MOTOR PDF DEUDORES ---
 def generar_pdf_deudores_pro(data_agrupada, titulo_str, nombre_archivo):
     buffer = io.BytesIO()
-    doc = SimpleDocTemplate(buffer, pagesize=letter, rightMargin=40, leftMargin=40, topMargin=40, bottomMargin=40)
+    doc = SimpleDocTemplate(buffer, pagesize=letter, title=titulo_str,
+                            rightMargin=40, leftMargin=40, topMargin=40, bottomMargin=40)
     estilos = getSampleStyleSheet()
     elementos = []
-
-    # 🚩 Estilos corregidos para que el título salga centrado y limpio
-    title_style = estilos['Title']
-    title_style.fontName = 'Helvetica-Bold'
-
-    sub_header_style = estilos['Heading2']
-    sub_header_style.alignment = TA_CENTER
-    sub_header_style.backColor = None
-    sub_header_style.fontName = 'Helvetica-Bold'
-    sub_header_style.fontSize = 14
-    sub_header_style.spaceAfter = 10
-
-    date_style = estilos['Normal']
-    date_style.alignment = TA_CENTER
-
-    elementos.append(Paragraph("<b>SISTEMA DE CONTROL DE PAGOS</b>", title_style))
-    elementos.append(Paragraph(f"<b>{titulo_str}</b>", sub_header_style))
-    elementos.append(Paragraph(f"Fecha de generación: {datetime.now().strftime('%d/%m/%Y %H:%M')}", date_style))
-    elementos.append(Spacer(1, 20))
-
+    crear_encabezado_logo(elementos, titulo_str, estilos)
+    
     total_general = 0
-    for alumno in data_agrupada:
-        elementos.append(Paragraph(
-            f"<b>{alumno['Alumno']}</b> — <font color='#b91c1c'>{alumno['Matrícula']}</font> ({alumno['Cantidad']} adeudos)",
-            estilos['Heading3']
-        ))
-        elementos.append(Spacer(1, 5))
+    estilo_nombre = estilos['Normal']
+    estilo_nombre.fontSize = 11
+    estilo_nombre.leftIndent = 0
 
-        tabla_data = [["Concepto", "Monto"]]
-        for c in alumno["Conceptos"]:
+    for alu in data_agrupada:
+        bloque = []
+        nombre_str = f"<font color='#0f172a'><b>{alu['Alumno']}</b></font> — <font color='#b91c1c'><b>{alu['Matrícula']}</b></font>"
+        bloque.append(Paragraph(nombre_str, estilo_nombre))
+        bloque.append(Spacer(1, 5))
+        
+        tabla_data = [["Concepto", "Monto Restante"]] 
+        for c in alu["Conceptos"]:
             tabla_data.append([c["concepto"], "${:,.2f}".format(c["monto"])])
-
-        tabla_data.append(["TOTAL ADEUDO ALUMNO", "${:,.2f}".format(alumno['Total'])])
-        total_general += alumno["Total"]
-
-        t = Table(tabla_data, colWidths=[350, 80], hAlign='LEFT')
+        tabla_data.append(["TOTAL ADEUDO", "${:,.2f}".format(alu['Total'])])
+        total_general += alu["Total"]
+        
+        t = Table(tabla_data, colWidths=[460, 70], hAlign='LEFT')
         t.setStyle(TableStyle([
-            ('BACKGROUND', (0,0), (-1,0), colors.HexColor("#b91c1c")),
+            ('BACKGROUND', (0,0), (-1,0), colors.HexColor("#b91c1c")), 
             ('TEXTCOLOR', (0,0), (-1,0), colors.whitesmoke),
-            ('GRID', (0,0), (-1,-1), 0.25, colors.grey),
+            ('GRID', (0,0), (-1,-1), 0.5, colors.HexColor("#cbd5e1")),
             ('ALIGN', (1,1), (-1,-1), 'RIGHT'),
             ('FONTNAME', (0,0), (-1,0), 'Helvetica-Bold'),
             ('BACKGROUND', (0,-1), (-1,-1), colors.whitesmoke),
             ('TEXTCOLOR', (0,-1), (-1,-1), colors.HexColor("#b91c1c")),
         ]))
-        elementos.append(t)
-        elementos.append(Spacer(1, 15))
-
+        bloque.append(t)
+        bloque.append(Spacer(1, 15))
+        elementos.append(KeepTogether(bloque))
+        
     elementos.append(Spacer(1, 20))
-    elementos.append(Paragraph(
-        f"<div align='right'><b>TOTAL GENERAL DE ADEUDOS: ${total_general:,.2f}</b></div>",
-        estilos['Heading2']
-    ))
-
-    doc.build(elementos)
+    estilo_total = estilos['Normal']
+    estilo_total.fontSize = 12
+    elementos.append(Paragraph(f"<b>TOTAL GENERAL DE ADEUDOS: ${total_general:,.2f}</b>", estilo_total))
+    
+    doc.build(elementos, onFirstPage=pie_de_pagina, onLaterPages=pie_de_pagina)
     buffer.seek(0)
     return send_file(buffer, mimetype='application/pdf', as_attachment=True, download_name=nombre_archivo)
 
-# --- 2. MOTOR DE PDF GENÉRICO (CORTE, INGRESOS, CORRIENTE) ---
-def generar_pdf_generico_pro(titulo_str, data, color_tema, nombre_archivo):
+# --- 4. MOTOR PDF GENÉRICO CON TOTALIZADOR ---
+def generar_pdf_generico_pro(titulo_str, data, color_tema, nombre_archivo, total_suma=None, titulo_total="TOTAL"):
     buffer = io.BytesIO()
-    doc = SimpleDocTemplate(buffer, pagesize=letter, rightMargin=30, leftMargin=30, topMargin=30, bottomMargin=30)
+    doc = SimpleDocTemplate(buffer, pagesize=letter, title=titulo_str,
+                            rightMargin=40, leftMargin=40, topMargin=40, bottomMargin=40)
     estilos = getSampleStyleSheet()
+    elementos = []
+    crear_encabezado_logo(elementos, titulo_str, estilos)
     
-    elementos = [
-        Paragraph("<b>SISTEMA DE CONTROL DE PAGOS</b>", estilos['Title']),
-        Paragraph(f"<b>{titulo_str}</b>", estilos['Heading2']),
-        Paragraph(f"Fecha de reporte: {datetime.now().strftime('%d/%m/%Y %H:%M')}", estilos['Normal']),
-        Spacer(1, 20)
-    ]
-
     if not data:
         elementos.append(Paragraph("No se encontraron registros.", estilos['Normal']))
     else:
         headers = list(data[0].keys())
         cuerpo = [headers]
-        for d in data:
-            cuerpo.append([str(valor) for valor in d.values()])
-            
-        if "Monto" in headers:
-            col_idx = headers.index("Monto")
-            total = sum(float(d[headers[col_idx]]) for d in data)
-            fila_total = [""] * len(headers); fila_total[0] = "TOTAL"; fila_total[col_idx] = "${:,.2f}".format(total)
-            cuerpo.append(fila_total)
+        for d in data: cuerpo.append([str(valor) for valor in d.values()])
+        
+        anchos = [530 / len(headers)] * len(headers)
+        if "Folio" in headers and "Concepto" in headers:
+            anchos = [60, 200, 200, 70] 
+        elif "Fecha" in headers and "Monto" in headers:
+            anchos = [70, 195, 195, 70] 
+        elif "Matrícula" in headers and "Estatus" in headers:
+            anchos = [80, 350, 100]    
 
-        t = Table(cuerpo, hAlign='CENTER', colWidths=[80, 220, 130, 80])
-        t.setStyle(TableStyle([
+        t = Table(cuerpo, colWidths=anchos, hAlign='LEFT') 
+        
+        estilo_tabla = TableStyle([
             ('BACKGROUND', (0,0), (-1,0), color_tema),
             ('TEXTCOLOR', (0,0), (-1,0), colors.whitesmoke),
-            ('GRID', (0,0), (-1,-1), 0.25, colors.grey),
-            ('ALIGN', (0,0), (-1,-1), 'CENTER'),
+            ('GRID', (0,0), (-1,-1), 0.5, colors.HexColor("#cbd5e1")), 
+            ('ALIGN', (0,0), (-1,-1), 'LEFT'),
             ('FONTNAME', (0,0), (-1,0), 'Helvetica-Bold'),
             ('FONTSIZE', (0,0), (-1,-1), 9),
-            ('BACKGROUND', (0,-1), (-1,-1), colors.whitesmoke)
-        ]))
-        elementos.append(t)
+            ('TEXTCOLOR', (0,1), (-1,-1), colors.black), 
+        ])
+        
+        for i in range(1, len(cuerpo)):
+            bg_color = colors.HexColor("#f8fafc") if i % 2 == 0 else colors.white
+            estilo_tabla.add('BACKGROUND', (0,i), (-1,i), bg_color)
 
-    doc.build(elementos)
+        t.setStyle(estilo_tabla)
+        elementos.append(t)
+        
+        # 🔥 AGREGAMOS EL BLOQUE DEL TOTAL COMO EN DEUDORES
+        if total_suma is not None:
+            elementos.append(Spacer(1, 20))
+            estilo_total = estilos['Normal']
+            estilo_total.fontSize = 12
+            elementos.append(Paragraph(f"<b>{titulo_total}: ${total_suma:,.2f}</b>", estilo_total))
+        
+    doc.build(elementos, onFirstPage=pie_de_pagina, onLaterPages=pie_de_pagina)
     buffer.seek(0)
     return send_file(buffer, mimetype='application/pdf', as_attachment=True, download_name=nombre_archivo)
 
-# --- 3. FUNCIÓN AUXILIAR EXCEL ---
+# --- 5. EXCEL PRO ---
 def generar_excel(data, nombre_hoja, nombre_archivo):
-    df = pd.DataFrame(data) if data else pd.DataFrame([{"Mensaje": "Sin datos"}])
+    df = pd.DataFrame(data) if data else pd.DataFrame([{"Aviso": "Sin datos"}])
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine='openpyxl') as writer:
         df.to_excel(writer, index=False, sheet_name=nombre_hoja)
+        ws = writer.sheets[nombre_hoja]
+        header_fill = PatternFill(start_color="1E293B", end_color="1E293B", fill_type="solid")
+        header_font = Font(color="FFFFFF", bold=True)
+        for col_idx, column in enumerate(df.columns, 1):
+            cell = ws.cell(row=1, column=col_idx)
+            cell.fill, cell.font, cell.alignment = header_fill, header_font, Alignment(horizontal="center")
+            max_len = max(df[column].astype(str).map(len).max(), len(str(column))) + 4
+            ws.column_dimensions[ws.cell(row=1, column=col_idx).column_letter].width = max_len
+        ws.auto_filter.ref = ws.dimensions
     output.seek(0)
     return send_file(output, mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', as_attachment=True, download_name=nombre_archivo)
 
 # ==========================================
-# ENDPOINTS DE DESCARGA
+#                ENDPOINTS
 # ==========================================
 
-@reportes_bp.route("/corte-caja", methods=["GET"])
+@reportes_bp.route("/reportes/dashboard", methods=["GET", "OPTIONS"])
+def dashboard_ingresos():
+    if request.method == "OPTIONS": return jsonify({}), 200
+    try:
+        hoy = date.today(); p_mes = hoy.replace(day=1)
+        
+        pagos_hoy = db.session.query(Pago, EstructuraPago).join(EstructuraPago).filter(
+            Pago.fecha_pago == hoy, Pago.estado.in_(['PAGADO', 'PARCIAL'])).all()
+            
+        pagos_mes = db.session.query(Pago, EstructuraPago).join(EstructuraPago).filter(
+            Pago.fecha_pago >= p_mes, Pago.fecha_pago <= hoy, Pago.estado.in_(['PAGADO', 'PARCIAL'])).all()
+
+        suma_hoy = sum([float(p.monto_abonado) if p.monto_abonado else float(e.monto or 0) for p, e in pagos_hoy])
+        suma_mes = sum([float(p.monto_abonado) if p.monto_abonado else float(e.monto or 0) for p, e in pagos_mes])
+
+        return jsonify({"ingresos_hoy": suma_hoy, "ingresos_mes": suma_mes})
+    except Exception as e: return jsonify({"error": "Dashboard error"}), 500
+
+@reportes_bp.route("/reportes/corte-caja", methods=["GET", "OPTIONS"])
 def corte_caja():
+    if request.method == "OPTIONS": return jsonify({}), 200
     try:
-        formato = request.args.get('formato', 'pdf')
-        hoy_db = date.today()
-        pagos = db.session.query(Pago, Alumno, EstructuraPago).select_from(Pago)\
-            .join(Alumno, Pago.id_alumno == Alumno.id_alumno)\
-            .join(EstructuraPago, Pago.id_estructura == EstructuraPago.id_estructura)\
-            .filter(Pago.fecha_pago == hoy_db)\
-            .order_by(Alumno.apellido, Alumno.nombre).all()
+        formato = request.args.get('formato', 'pdf'); hoy = date.today()
+        pagos = db.session.query(Pago, Alumno, EstructuraPago).select_from(Pago).join(Alumno).join(EstructuraPago).filter(Pago.fecha_pago == hoy).all()
         
-        data = [{"Folio": p.folio or "S/F", "Alumno": f"{a.apellido} {a.nombre}".upper(), "Concepto": e.concepto, "Monto": float(e.monto)} for p, a, e in pagos]
-        if formato == 'excel':
-            return generar_excel(data, "Corte Diario", f"Corte_{hoy_db}.xlsx")
-        return generar_pdf_generico_pro(f"Corte de Caja Diario - {hoy_db}", data, colors.HexColor("#15803d"), "Corte_Hoy.pdf")
-    except Exception:
-        print(traceback.format_exc())
-        return jsonify({"error": "Error interno"}), 500
+        def formato_folio(p):
+            folio_str = str(p.folio or "S/F")
+            if p.estado == 'PARCIAL': return folio_str
+            return folio_str.split('(')[0].strip()
 
-@reportes_bp.route("/deudores", methods=["GET"])
-def reporte_deudores():
-    id_gen = request.args.get('generacion')
-    if not id_gen or id_gen in ["null", "undefined", ""]:
-        return jsonify({"error": "Debe seleccionar una generación"}), 400
-    try:
-        id_gen = int(id_gen); id_grupo = request.args.get('grupo'); formato = request.args.get('formato', 'pdf')
-        query = db.session.query(Alumno, Pago, EstructuraPago).select_from(Alumno)\
-            .join(Pago, Alumno.id_alumno == Pago.id_alumno)\
-            .join(EstructuraPago, Pago.id_estructura == EstructuraPago.id_estructura)\
-            .filter(Alumno.id_generacion == id_gen, Pago.estado == 'PENDIENTE')\
-            .order_by(Alumno.apellido, Alumno.nombre)
-        if id_grupo and id_grupo not in ["", "null", "undefined"]:
-            query = query.join(Grupo, Alumno.id_grupo == Grupo.id_grupo).filter(Grupo.nombre_grupo == id_grupo)
-        resultados = query.all()
+        data = []
+        total_suma = 0 # 🔥 Acumulador
+        for p, a, e in pagos:
+            monto_real = float(p.monto_abonado) if p.monto_abonado else float(e.monto or 0)
+            if p.estado == 'PAGADO' or monto_real > 0:
+                total_suma += monto_real
+                data.append({
+                    "Folio": formato_folio(p), 
+                    "Alumno": f"{a.apellido} {a.nombre}".upper(), 
+                    "Concepto": e.concepto, 
+                    "Monto": "${:,.2f}".format(monto_real)
+                })
         
-        alumnos_dict = {}
-        for a, p, e in resultados:
-            key = a.id_alumno
-            if key not in alumnos_dict:
-                alumnos_dict[key] = {"Matrícula": a.matricula, "Alumno": f"{a.apellido} {a.nombre}".upper(), "Conceptos": [], "Total": 0}
-            alumnos_dict[key]["Conceptos"].append({"concepto": e.concepto, "monto": float(e.monto), "orden": (getattr(e, 'anio', 0), getattr(e, 'mes', 0))})
-            alumnos_dict[key]["Total"] += float(e.monto)
-            
-        data_agrupada = list(alumnos_dict.values())
-        for alu in data_agrupada:
-            alu["Conceptos"].sort(key=lambda x: x["orden"])
-            alu["Cantidad"] = len(alu["Conceptos"])
-            
-        if formato == 'excel':
-            excel_flat = [{"Matrícula": al["Matrícula"], "Alumno": al["Alumno"], "Concepto": co["concepto"], "Monto": co["monto"]} for al in data_agrupada for co in al["Conceptos"]]
-            return generar_excel(excel_flat, "Deudores", "Deudores.xlsx")
-        return generar_pdf_deudores_pro(data_agrupada, "REPORTE DETALLADO DE ALUMNOS CON DEUDAS", "Deudores.pdf")
-    except Exception:
-        print(traceback.format_exc())
-        return jsonify({"error": "Error interno"}), 500
+        try: registrar_accion(obtener_id_admin(), "DESCARGA_CORTE_CAJA", f"Descargó el Corte de Caja del día de hoy en formato {formato.upper()}")
+        except: pass
 
-@reportes_bp.route("/ingresos", methods=["GET"])
+        if formato == 'excel': 
+            # Si es Excel, agregamos la fila manual al final
+            if data: data.append({"Folio": "", "Alumno": "", "Concepto": "TOTAL DEL DÍA", "Monto": "${:,.2f}".format(total_suma)})
+            return generar_excel(data, "Corte", f"Corte_{hoy}.xlsx")
+            
+        return generar_pdf_generico_pro(f"CORTE DE CAJA DIARIO", data, colors.HexColor("#1E293B"), "Corte.pdf", total_suma=total_suma, titulo_total="TOTAL INGRESOS DEL DÍA")
+    except Exception as e: return jsonify({"error": str(e)}), 500
+
+@reportes_bp.route("/reportes/ingresos", methods=["GET", "OPTIONS"])
 def reporte_ingresos():
+    if request.method == "OPTIONS": return jsonify({}), 200
     try:
-        inicio = request.args.get('inicio'); fin = request.args.get('fin'); formato = request.args.get('formato', 'pdf')
-        if not inicio or not fin: return jsonify({"error": "Fechas requeridas"}), 400
-        pagos = db.session.query(Pago, Alumno, EstructuraPago).select_from(Pago)\
-            .join(Alumno, Pago.id_alumno == Alumno.id_alumno)\
-            .join(EstructuraPago, Pago.id_estructura == EstructuraPago.id_estructura)\
-            .filter(Pago.fecha_pago.between(inicio, fin))\
-            .order_by(Alumno.apellido, Alumno.nombre).all()
-            
-        data = [{"Fecha": p.fecha_pago.strftime("%d/%m/%Y"), "Alumno": f"{a.apellido} {a.nombre}".upper(), "Concepto": e.concepto, "Monto": float(e.monto)} for p, a, e in pagos]
-        if formato == 'excel': return generar_excel(data, "Histórico", "Ingresos.xlsx")
-        return generar_pdf_generico_pro(f"Histórico de Ingresos ({inicio} a {fin})", data, colors.HexColor("#2563eb"), "Historico.pdf")
-    except Exception:
-        print(traceback.format_exc())
-        return jsonify({"error": "Error interno"}), 500
+        inicio = request.args.get('inicio')
+        fin = request.args.get('fin')
+        formato = request.args.get('formato', 'pdf')
+        
+        try: registrar_accion(obtener_id_admin(), "DESCARGA_INGRESOS", f"Descargó histórico de ingresos ({inicio} a {fin}) en formato {formato.upper()}")
+        except: pass
 
-@reportes_bp.route("/al-corriente", methods=["GET"])
-def reporte_al_corriente():
+        pagos = db.session.query(Pago, Alumno, EstructuraPago).select_from(Pago).join(Alumno).join(EstructuraPago).filter(Pago.fecha_pago.between(inicio, fin)).all()
+        
+        data = []
+        total_suma = 0 # 🔥 Acumulador
+        for p, a, e in pagos:
+            monto_real = float(p.monto_abonado) if p.monto_abonado else float(e.monto or 0)
+            if p.estado == 'PAGADO' or monto_real > 0:
+                total_suma += monto_real
+                data.append({
+                    "Fecha": p.fecha_pago.strftime("%d/%m/%Y"), 
+                    "Alumno": f"{a.apellido} {a.nombre}".upper(), 
+                    "Concepto": e.concepto, 
+                    "Monto": "${:,.2f}".format(monto_real)
+                })
+        
+        if formato == 'excel': 
+            # Si es Excel, agregamos la fila manual al final
+            if data: data.append({"Fecha": "", "Alumno": "", "Concepto": "TOTAL INGRESOS", "Monto": "${:,.2f}".format(total_suma)})
+            return generar_excel(data, "Ingresos", "Historico_Ingresos.xlsx")
+            
+        return generar_pdf_generico_pro(f"HISTÓRICO DE INGRESOS ({inicio} al {fin})", data, colors.HexColor("#1E293B"), "Historico.pdf", total_suma=total_suma, titulo_total="TOTAL GENERAL DE INGRESOS")
+    except Exception as e: return jsonify({"error": str(e)}), 500
+
+@reportes_bp.route("/reportes/deudores", methods=["GET", "OPTIONS"])
+def reporte_deudores():
+    if request.method == "OPTIONS": return jsonify({}), 200
+    id_gen = limpiar_param(request.args.get('generacion'))
+    if not id_gen: return jsonify({"error": "Falta Gen"}), 400
     try:
-        id_gen = request.args.get('generacion')
-        if not id_gen or id_gen in ["null", "undefined", ""]: return jsonify({"error": "Seleccione generación"}), 400
-        id_gen = int(id_gen); id_grupo = request.args.get('grupo'); formato = request.args.get('formato', 'pdf')
+        id_grupo = limpiar_param(request.args.get('grupo')); sem = limpiar_param(request.args.get('semestre')); formato = request.args.get('formato', 'pdf')
         
-        subquery_deben = db.session.query(Pago.id_alumno).filter(Pago.estado == 'PENDIENTE').subquery()
-        query = Alumno.query.filter(Alumno.id_generacion == id_gen, ~Alumno.id_alumno.in_(subquery_deben)).order_by(Alumno.apellido, Alumno.nombre)
-        if id_grupo and id_grupo not in ["", "null", "undefined"]: query = query.join(Grupo).filter(Grupo.nombre_grupo == id_grupo)
+        try: registrar_accion(obtener_id_admin(), "DESCARGA_DEUDORES", f"Descargó reporte de deudores (Gen: {id_gen}, Grupo: {id_grupo or 'Todos'}, Sem: {sem or 'Todos'}) en formato {formato.upper()}")
+        except: pass
+
+        query = Alumno.query.filter(Alumno.id_generacion == int(id_gen), Alumno.estatus.in_(['ACTIVO', 'BAJA']))
+        if id_grupo: query = query.join(Grupo).filter(Grupo.nombre_grupo == id_grupo)
+        if sem: query = query.filter(Alumno.semestre_actual == int(sem))
+        alumnos = query.all(); alu_dict = {}
+        for a in alumnos:
+            f_limite = a.fecha_baja if (a.estatus == 'BAJA' and a.fecha_baja) else date.today()
+            pagos = db.session.query(Pago, EstructuraPago).join(EstructuraPago).filter(Pago.id_alumno == a.id_alumno, Pago.estado.in_(['PENDIENTE', 'PARCIAL'])).all()
+            for p, e in pagos:
+                if (e.semestre or 1) <= (a.semestre_actual or 1):
+                    vencido = False
+                    if e.anio and e.mes:
+                        if e.anio < f_limite.year or (e.anio == f_limite.year and e.mes <= f_limite.month): vencido = True
+                    else: vencido = (a.estatus != 'BAJA')
+                    if vencido:
+                        deuda = float(e.monto) - float(p.monto_abonado or 0)
+                        if deuda > 0:
+                            if a.id_alumno not in alu_dict:
+                                nom = f"{a.apellido} {a.nombre}".upper() + (" [BAJA]" if a.estatus == 'BAJA' else "")
+                                alu_dict[a.id_alumno] = {"Matrícula": a.matricula, "Alumno": nom, "Conceptos": [], "Total": 0}
+                            alu_dict[a.id_alumno]["Conceptos"].append({"concepto": e.concepto, "monto": deuda})
+                            alu_dict[a.id_alumno]["Total"] += deuda
+        data = list(alu_dict.values())
+        if not data: return jsonify({"error": "Sin deudores"}), 404
+        if formato == 'excel':
+            return generar_excel([{"Matrícula": x["Matrícula"], "Alumno": x["Alumno"], "Adeudo": x["Total"]} for x in data], "Deudores", "Deudores.xlsx")
+        titulo = f"ALUMNOS CON DEUDAS" + (f" - {sem}° SEM" if sem else "")
+        return generar_pdf_deudores_pro(data, titulo, "Deudores.pdf")
+    except Exception as e: return jsonify({"error": str(e)}), 500
+
+@reportes_bp.route("/reportes/al-corriente", methods=["GET", "OPTIONS"])
+def reporte_al_corriente():
+    if request.method == "OPTIONS": return jsonify({}), 200
+    id_gen = limpiar_param(request.args.get('generacion'))
+    try:
+        id_grupo = limpiar_param(request.args.get('grupo')); sem = limpiar_param(request.args.get('semestre')); formato = request.args.get('formato', 'pdf')
         
-        alumnos = query.all()
-        data = [{"Matrícula": a.matricula, "Alumno": f"{a.apellido} {a.nombre}".upper(), "Estatus": "AL CORRIENTE"} for a in alumnos]
+        try: registrar_accion(obtener_id_admin(), "DESCARGA_AL_CORRIENTE", f"Descargó reporte de alumnos al corriente (Gen: {id_gen}, Grupo: {id_grupo or 'Todos'}, Sem: {sem or 'Todos'}) en formato {formato.upper()}")
+        except: pass
+
+        query = Alumno.query.filter(Alumno.id_generacion == int(id_gen), Alumno.estatus == 'ACTIVO')
+        if id_grupo: query = query.join(Grupo).filter(Grupo.nombre_grupo == id_grupo)
+        if sem: query = query.filter(Alumno.semestre_actual == int(sem))
+        alumnos = query.all(); data = []
+        for a in alumnos:
+            tiene_deuda = False
+            pagos = db.session.query(Pago, EstructuraPago).join(EstructuraPago).filter(Pago.id_alumno == a.id_alumno, Pago.estado != 'PAGADO').all()
+            for p, e in pagos:
+                if (e.semestre or 1) <= (a.semestre_actual or 1):
+                    if e.anio and e.mes:
+                        if e.anio < date.today().year or (e.anio == date.today().year and e.mes <= date.today().month): tiene_deuda = True; break
+                    else: tiene_deuda = True; break
+            if not tiene_deuda:
+                data.append({"Matrícula": a.matricula, "Alumno": f"{a.apellido} {a.nombre}".upper(), "Estatus": "AL CORRIENTE"})
+        if not data: return jsonify({"error": "Sin alumnos al corriente"}), 404
+        titulo = f"ALUMNOS AL CORRIENTE" + (f" - {sem}° SEM" if sem else "")
         if formato == 'excel': return generar_excel(data, "Al Corriente", "Alumnos_Al_Corriente.xlsx")
-        return generar_pdf_generico_pro("Listado de Alumnos al Corriente", data, colors.HexColor("#0891b2"), "Al_Corriente.pdf")
-    except Exception:
-        print(traceback.format_exc())
-        return jsonify({"error": "Error interno"}), 500
+        return generar_pdf_generico_pro(titulo, data, colors.HexColor("#1E293B"), "Al_Corriente.pdf")
+    except Exception as e: return jsonify({"error": str(e)}), 500
+
+@reportes_bp.route("/reportes/respaldo", methods=["GET", "OPTIONS"])
+def respaldo_db():
+    if request.method == "OPTIONS": return jsonify({}), 200
+    
+    DB_HOST = 'localhost'
+    DB_USER = 'root'    
+    DB_PASS = ''        
+    DB_NAME = 'sistema_prepajmu' 
+
+    ruta_mysqldump = r"C:\xampp\mysql\bin\mysqldump.exe" 
+    
+    if DB_PASS == '':
+        comando = f"{ruta_mysqldump} -h {DB_HOST} -u {DB_USER} {DB_NAME}"
+    else:
+        comando = f"{ruta_mysqldump} -h {DB_HOST} -u {DB_USER} -p{DB_PASS} {DB_NAME}"
+
+    try:
+        proceso = subprocess.Popen(comando, stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=True)
+        salida, error = proceso.communicate()
+
+        if proceso.returncode != 0:
+            print(f"❌ ERROR DE MYSQLDUMP: {error.decode('utf-8', errors='ignore')}")
+            return jsonify({"error": "No se pudo crear el respaldo. Revisa la consola."}), 500
+
+        buffer = io.BytesIO(salida)
+        buffer.seek(0)
+        
+        fecha_str = datetime.now().strftime("%d_%m_%Y_%H%M")
+        nombre_archivo = f"Respaldo_Prepa_{fecha_str}.sql"
+
+        try: registrar_accion(obtener_id_admin(), "RESPALDO_BD", "Descargó un respaldo técnico completo (.sql) de la base de datos.")
+        except: pass
+
+        return send_file(buffer, as_attachment=True, download_name=nombre_archivo, mimetype='application/sql')
+
+    except Exception as e: 
+        return jsonify({"error": str(e)}), 500

@@ -8,8 +8,13 @@ class Pago(db.Model):
     id_estructura = db.Column(db.Integer, db.ForeignKey('estructura_pago.id_estructura'), nullable=False)
 
     fecha_pago = db.Column(db.Date)
-    monto_pagado = db.Column(db.Numeric(10, 2))
-    estado = db.Column(db.Enum('PENDIENTE', 'PAGADO'), default='PENDIENTE')
+    
+    # 🚩 CAMBIO 1: Columna para registrar el dinero que va dejando el alumno (Abonos)
+    monto_abonado = db.Column(db.Numeric(10, 2), default=0.00)
+    
+    # 🚩 CAMBIO 2: Se agregó 'PARCIAL' (y 'CANCELADO' por seguridad) al ENUM
+    estado = db.Column(db.Enum('PENDIENTE', 'PARCIAL', 'PAGADO', 'CANCELADO'), default='PENDIENTE')
+    
     folio = db.Column(db.String(50))
     numero_oportunidad = db.Column(db.Integer)
 

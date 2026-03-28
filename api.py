@@ -14,6 +14,7 @@ from routes.alumno_routes import alumno_bp
 from routes.catalogo_routes import catalogo_bp
 from routes.caja_routes import caja_bp
 from routes.reportes_routes import reportes_bp
+from routes.bitacora_routes import bitacora_bp
 
 app = Flask(__name__)
 
@@ -27,10 +28,16 @@ jwt = JWTManager(app)
 # ==========================
 # CONFIGURACIÓN APP Y BD
 # ==========================
-CORS(app, origins=["http://localhost:4200"])
+# Configuración Maestra de CORS
+CORS(app, resources={
+    r"/api/*": {
+        "origins": ["http://localhost:4200"],
+        "allow_headers": ["Authorization", "Content-Type"],
+        "methods": ["GET", "POST", "PUT", "DELETE", "OPTIONS"]
+    }
+})
 app.config.from_object(config['development'])
 db.init_app(app)
-
 # ==========================
 # REGISTRO DE RUTAS (BLUEPRINTS)
 # ==========================
@@ -39,7 +46,8 @@ app.register_blueprint(admin_bp, url_prefix='/api',)
 app.register_blueprint(alumno_bp, url_prefix='/api')
 app.register_blueprint(catalogo_bp, url_prefix='/api')
 app.register_blueprint(caja_bp, url_prefix='/api')
-app.register_blueprint(reportes_bp, url_prefix='/api/reportes')
+app.register_blueprint(reportes_bp, url_prefix='/api')
+app.register_blueprint(bitacora_bp, url_prefix='/api') # Registro del Blueprint de bitácora
 
 @app.route("/")
 def home():

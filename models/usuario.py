@@ -7,11 +7,12 @@ class Usuario(db.Model):
     nombre = db.Column(db.String(100), nullable=False)
     correo = db.Column(db.String(100), unique=True, nullable=False)
     contraseña = db.Column(db.String(255), nullable=False)
-    rol = db.Column(db.Enum('ADMIN', 'ALUMNO'), nullable=False)
+    # 🔥 CAMBIO: Usamos String en lugar de Enum para dar total libertad a los roles
+    rol = db.Column(db.String(20), nullable=False) 
     puesto = db.Column(db.String(50), nullable=True)
-    estado = db.Column(db.Enum('ACTIVO', 'INACTIVO'), default='ACTIVO')
+    # 🔥 CAMBIO: También aquí para evitar líos con nuevos estados
+    estado = db.Column(db.String(20), default='ACTIVO')
 
-    # Relaciones
     alumno = db.relationship('Alumno', back_populates='usuario', uselist=False)
     bitacoras = db.relationship('Bitacora', back_populates='usuario')
     

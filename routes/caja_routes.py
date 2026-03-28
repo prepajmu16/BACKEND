@@ -1,20 +1,18 @@
 from flask import Blueprint, request, jsonify
 from extensions import db
 from models import Pago, EstructuraPago, Alumno
-from datetime import datetime # 👈 IMPORTANTE TENER ESTO HASTA ARRIBA
-
+from datetime import datetime
+# 📸 IMPORTAMOS LAS HERRAMIENTAS DE BITÁCORA
+from helpers import registrar_accion, obtener_id_admin
 
 caja_bp = Blueprint('caja_bp', __name__)
 
-# Pega aquí exactamente tus funciones:
-# @caja_bp.route("/estructura-pagos...", methods=["GET", "POST", "DELETE"]) ...
 # ==========================================
 # 💰 MÓDULO FINANCIERO: ESTRUCTURA DE PAGOS
 # ==========================================
 @caja_bp.route("/estructura-pagos/<int:id_generacion>", methods=["GET"])
 def obtener_estructura(id_generacion):
     try:
-        # Buscamos todos los cobros programados para una generación específica
         conceptos = EstructuraPago.query.filter_by(id_generacion=id_generacion).all()
         resultado = []
         for c in conceptos:
@@ -32,7 +30,6 @@ def obtener_estructura(id_generacion):
 @caja_bp.route("/estructura-pagos", methods=["POST"])
 def crear_concepto():
     data = request.get_json()
-    
     campos_requeridos = ("id_generacion", "concepto", "monto", "semestre_aplicable", "fecha_vencimiento")
     if not all(k in data for k in campos_requeridos):
         return jsonify({"error": "Faltan datos obligatorios"}), 400
@@ -47,6 +44,14 @@ def crear_concepto():
         )
         db.session.add(nuevo_concepto)
         db.session.commit()
+        
+        # 📸 BITÁCORA: Nuevo concepto
+        registrar_accion(
+            id_usuario=obtener_id_admin(),
+            accion="NUEVO_CONCEPTO_PAGO",
+            descripcion=f"Agregó el concepto {nuevo_concepto.concepto} (${nuevo_concepto.monto}) a la Generación {data['id_generacion']}"
+        )
+
         return jsonify({"message": "Concepto de pago creado exitosamente"}), 201
     except Exception as e:
         db.session.rollback()
@@ -59,13 +64,22 @@ def eliminar_concepto(id_estructura):
         return jsonify({"error": "Concepto no encontrado"}), 404
         
     try:
+        nombre_concepto = concepto.concepto
         db.session.delete(concepto)
         db.session.commit()
+        
+        # 📸 BITÁCORA: Eliminar concepto
+        registrar_accion(
+            id_usuario=obtener_id_admin(),
+            accion="ELIMINAR_CONCEPTO_PAGO",
+            descripcion=f"Eliminó el concepto {nombre_concepto} (ID: {id_estructura})"
+        )
+
         return jsonify({"message": "Concepto eliminado correctamente"}), 200
     except Exception as e:
         db.session.rollback()
         return jsonify({"error": "No se puede eliminar porque ya hay recibos cobrados con este concepto."}), 500    
-# @caja_bp.route("/caja/deudas/<string:matricula>", methods=["GET"]) ...
+
 # ==========================================
 # 💵 MÓDULO DE CAJA (PUNTO DE COBRO)
 # ==========================================
@@ -76,9 +90,8 @@ def obtener_deudas(matricula):
         if not alumno:
             return jsonify({"error": "Alumno no encontrado"}), 404
 
-        # Simulamos la consulta a una tabla de 'deudas' o 'recibos' pendientes
-        # Ajusta esto según cómo se llame tu tabla de pagos en MySQL
-        pagos_pendientes = Pago.query.filter_by(id_alumno=alumno.id_alumno, estatus_pago='PENDIENTE').all()
+        todos_los_pagos = Pago.query.filter_by(id_alumno=alumno.id_alumno).all()
+        pagos_pendientes = [p for p in todos_los_pagos if str(getattr(p, 'estado', getattr(p, 'estatus_pago', ''))).upper() in ['PENDIENTE', 'PARCIAL']]
         
         deudas = []
         for p in pagos_pendientes:
@@ -99,29 +112,35 @@ def obtener_deudas(matricula):
         }), 200
     except Exception as e:
         return jsonify({"error": str(e)}), 500
-# @caja_bp.route("/caja/alumnos", methods=["GET"]) ...
-# ==========================================
-# 💵 MÓDULO DE CAJA: LISTADO DE COBRO Y CAJA
-# ==========================================
+
 # ==========================================
 # 💵 MÓDULO DE CAJA: LISTADO DE COBRO Y CAJA
 # ==========================================
 @caja_bp.route("/caja/alumnos", methods=["GET"])
 def obtener_alumnos_caja():
     id_gen = request.args.get('generacion')
-    if not id_gen or id_gen == '0':
-        return jsonify({"error": "Debes seleccionar una generación"}), 400
-
     ahora = datetime.now()
-    mes_actual = ahora.month
-    anio_actual = ahora.year
 
     try:
-        alumnos = Alumno.query.filter_by(id_generacion=id_gen).all()
+        if id_gen and id_gen != '0':
+            alumnos = Alumno.query.filter_by(id_generacion=id_gen).all()
+        else:
+            alumnos = Alumno.query.all()
+
         resultado = []
         
         for a in alumnos:
-            # 1. Traemos TODOS los pagos de este alumno
+            estatus_alumno = getattr(a, 'estatus', 'ACTIVO')
+            semestre_actual_alumno = getattr(a, 'semestre_actual', 1) or 1
+            
+            # Límite de tiempo: Hoy (o la fecha de baja si el alumno desertó)
+            fecha_limite = ahora.date()
+            if estatus_alumno == 'BAJA' and getattr(a, 'fecha_baja', None):
+                fecha_limite = a.fecha_baja
+                
+            limite_anio = fecha_limite.year
+            limite_mes = fecha_limite.month
+
             pagos_del_alumno = db.session.query(Pago, EstructuraPago).join(
                 EstructuraPago, Pago.id_estructura == EstructuraPago.id_estructura
             ).filter(Pago.id_alumno == a.id_alumno).all()
@@ -130,33 +149,64 @@ def obtener_alumnos_caja():
             eee_pendientes = 0
             
             for p, e in pagos_del_alumno:
-                # 2. Verificamos que sea un pago PENDIENTE (Soporta Enums y Strings)
                 estado_pago = str(getattr(p, 'estatus_pago', getattr(p, 'estado', ''))).upper()
                 
-                if 'PENDIENTE' in estado_pago:
+                if estado_pago in ['PENDIENTE', 'PARCIAL']:
                     tipo_est = str(e.tipo).upper()
                     
-                    # 3. Si es Extraordinario o EEE, es deuda inmediata
-                    if 'EEE' in tipo_est or 'EXT' in tipo_est:
-                        eee_pendientes += 1
-                    else:
-                        # 4. Si es INSCRIPCIÓN o MENSUALIDAD, verificamos la Máquina del Tiempo
-                        if e.anio is not None and e.mes is not None:
-                            if e.anio < anio_actual:
-                                m_pendientes += 1
-                            elif e.anio == anio_actual and e.mes <= mes_actual:
-                                m_pendientes += 1
+                    cobro_anio = None
+                    cobro_mes = None
+                    
+                    # Extraer fechas si las tiene
+                    if hasattr(e, 'anio') and e.anio:
+                        cobro_anio = int(e.anio)
+                        cobro_mes = int(getattr(e, 'mes', 1))
+                    elif hasattr(e, 'fecha_vencimiento') and e.fecha_vencimiento:
+                        if isinstance(e.fecha_vencimiento, str):
+                            try:
+                                dt = datetime.strptime(e.fecha_vencimiento, "%Y-%m-%d")
+                                cobro_anio = dt.year
+                                cobro_mes = dt.month
+                            except: pass
                         else:
-                            # Fallback: si por alguna razón no tiene fecha, lo contamos
+                            cobro_anio = e.fecha_vencimiento.year
+                            cobro_mes = e.fecha_vencimiento.month
+                    
+                    es_deuda_real = False
+
+                    # 🔥 NUEVA LÓGICA: LA FECHA MANDA SOBRE EL SEMESTRE 🔥
+                    # 1. Si el cobro tiene fecha exacta (Mes y Año), nos guiamos 100% por el calendario
+                    if cobro_anio and cobro_mes:
+                        if cobro_anio < limite_anio:
+                            es_deuda_real = True
+                        elif cobro_anio == limite_anio:
+                            if cobro_mes < limite_mes:
+                                es_deuda_real = True
+                            elif cobro_mes == limite_mes:
+                                # Tolerancia: Se considera deuda si ya pasó el día 5 del mes
+                                if ahora.day > 5:
+                                    es_deuda_real = True
+                    # 2. Si NO tiene fecha (ej. una Inscripción genérica), entonces sí evaluamos por semestre
+                    else:
+                        semestre_cobro = getattr(e, 'semestre', 1) or 1
+                        if semestre_cobro <= semestre_actual_alumno and estatus_alumno != 'BAJA':
+                            es_deuda_real = True 
+                    
+                    if es_deuda_real:
+                        if 'MENSUALIDAD' in tipo_est:
                             m_pendientes += 1
+                        else:
+                            eee_pendientes += 1
 
             nombre_del_grupo = a.grupo.nombre_grupo if a.grupo else "S/G"
 
             resultado.append({
-                "nombre": f"{a.nombre} {a.apellido}",
+                "nombre": f"{a.apellido} {a.nombre}".upper(),
                 "matricula": a.matricula,
-                "generacion": a.id_generacion,
+                "generacion_id": a.id_generacion,
                 "grupo": nombre_del_grupo,
+                "estatus": estatus_alumno,
+                "semestre_actual": semestre_actual_alumno,
                 "tiene_adeudo": (m_pendientes + eee_pendientes) > 0,
                 "m_pendientes": m_pendientes,
                 "eee_pendientes": eee_pendientes
@@ -168,9 +218,9 @@ def obtener_alumnos_caja():
         import traceback
         traceback.print_exc()
         return jsonify({"error": str(e)}), 500
-# @caja_bp.route("/caja/historial/<string:matricula>", methods=["GET", "OPTIONS"]) ...
+    
 # ==========================================
-# 📊 API: OBTENER HISTORIAL DE PAGOS (Ajuste para fecha cruda)
+# 📊 API: OBTENER HISTORIAL DE PAGOS
 # ==========================================
 @caja_bp.route("/caja/historial/<string:matricula>", methods=["GET", "OPTIONS"])
 def historial_pagos(matricula):
@@ -181,35 +231,39 @@ def historial_pagos(matricula):
 
         historial = db.session.query(Pago, EstructuraPago).filter(
             Pago.id_estructura == EstructuraPago.id_estructura, Pago.id_alumno == alumno.id_alumno
-        ).all()
+        ).order_by(EstructuraPago.anio.asc(), EstructuraPago.mes.asc()).all()
         
         resultado = []
         for p, e in historial:
             categoria_str = e.tipo.value if hasattr(e.tipo, 'value') else str(e.tipo)
-            estado_str = p.estado.value if hasattr(p.estado, 'value') else str(p.estado)
+            estado_str = p.estado.value if hasattr(p.estado, 'value') else str(getattr(p, 'estado', getattr(p, 'estatus_pago', '')))
             
-            # Formatos de fecha (uno para la vista, uno para el input de editar)
             fecha_formateada = p.fecha_pago.strftime("%d/%m/%Y") if p.fecha_pago else None
             fecha_raw = p.fecha_pago.strftime("%Y-%m-%d") if p.fecha_pago else None
+
+            monto_total = float(e.monto) if e.monto is not None else 0.0
+            monto_abonado = float(getattr(p, 'monto_abonado', 0.0) or 0.0)
 
             resultado.append({
                 "id": p.id_pago, 
                 "concepto": e.concepto, 
-                "monto": float(e.monto) if e.monto is not None else 0.0,
+                "monto": monto_total,
+                "monto_abonado": monto_abonado,
+                "restante": monto_total - monto_abonado, 
                 "semestre": e.semestre, 
                 "categoria": categoria_str.split('.')[-1], 
                 "pagado": estado_str.split('.')[-1] == 'PAGADO',
+                "es_parcial": estado_str.split('.')[-1] == 'PARCIAL',
                 "fecha_pago": fecha_formateada, 
                 "fecha_raw": fecha_raw, 
                 "folio": p.folio,
-                # 🔥 AQUÍ AGREGAMOS MES Y AÑO PARA EL SEMÁFORO EN ANGULAR
-                "mes": e.mes,
-                "anio": e.anio
+                "mes": getattr(e, 'mes', None),
+                "anio": getattr(e, 'anio', None)
             })
         return jsonify(resultado), 200
     except Exception as err:
         return jsonify({"error": str(err)}), 500
-# @caja_bp.route("/caja/revertir/<int:id_pago>", methods=["PUT", "OPTIONS"]) ...
+
 # ==========================================
 # 🔄 API: REVERTIR PAGO (APAGAR BOTÓN)
 # ==========================================
@@ -220,80 +274,113 @@ def revertir_pago(id_pago):
         pago = Pago.query.get(id_pago)
         if not pago: return jsonify({"error": "Pago no encontrado"}), 404
 
-        # Regresamos el estado a pendiente y borramos fecha/folio
         if hasattr(pago, 'estatus_pago'): pago.estatus_pago = 'PENDIENTE'
         else: pago.estado = 'PENDIENTE'
         
+        fecha_borrada = pago.fecha_pago
+        folio_borrado = pago.folio
+        monto_borrado = getattr(pago, 'monto_abonado', 0.0)
+
         pago.fecha_pago = None
         pago.folio = None
+        if hasattr(pago, 'monto_abonado'): pago.monto_abonado = 0.0 
 
+        estructura = EstructuraPago.query.get(pago.id_estructura)
         db.session.commit()
+
+        # 📸 BITÁCORA: Revertir pago
+        registrar_accion(
+            id_usuario=obtener_id_admin(),
+            accion="REVERTIR_PAGO",
+            descripcion=f"Canceló el cobro de '{estructura.concepto}' (${monto_borrado}). Folio borrado: {folio_borrado}"
+        )
+
         return jsonify({"message": "Pago cancelado exitosamente"}), 200
     except Exception as e:
         db.session.rollback()
         return jsonify({"error": str(e)}), 500
-# @caja_bp.route("/caja/registrar", methods=["POST", "OPTIONS"]) ...
+
 # ==========================================
-# 💸 API: REGISTRAR UN PAGO FÍSICO (Asentar Folio)
+# 💸 API: REGISTRAR UN PAGO FÍSICO 
 # ==========================================
 @caja_bp.route("/caja/registrar", methods=["POST", "OPTIONS"])
 def registrar_cobro_oficial():
-    if request.method == "OPTIONS": 
-        return jsonify({}), 200
+    if request.method == "OPTIONS": return jsonify({}), 200
         
     data = request.get_json()
     id_pago = data.get("id_pago")
     fecha_ingresada = data.get("fecha")
     folio_ingresado = data.get("folio")
+    
+    monto_recibido = float(data.get("monto_recibido", 0))
 
     try:
         pago = Pago.query.get(id_pago)
-        if not pago:
-            return jsonify({"error": "Recibo no encontrado"}), 404
-
-        # Cambiamos el estado a PAGADO
-        if hasattr(pago, 'estatus_pago'):
-            pago.estatus_pago = 'PAGADO'
+        if not pago: return jsonify({"error": "Recibo no encontrado"}), 404
+        
+        estructura = EstructuraPago.query.get(pago.id_estructura)
+        costo_total = float(estructura.monto)
+        
+        abonado_historico = float(getattr(pago, 'monto_abonado', 0.0) or 0.0)
+        nuevo_acumulado = abonado_historico + monto_recibido
+        
+        if nuevo_acumulado >= costo_total:
+            estado_nuevo = 'PAGADO'
+            if hasattr(pago, 'monto_abonado'): pago.monto_abonado = costo_total
         else:
-            pago.estado = 'PAGADO'
+            estado_nuevo = 'PARCIAL'
+            if hasattr(pago, 'monto_abonado'): pago.monto_abonado = nuevo_acumulado
+
+        if hasattr(pago, 'estatus_pago'): pago.estatus_pago = estado_nuevo
+        else: pago.estado = estado_nuevo
             
-        # Asignamos la fecha y folio que escribió la secretaria
         pago.fecha_pago = fecha_ingresada 
-        pago.folio = folio_ingresado
+        
+        etiqueta_nuevo_folio = f"{folio_ingresado}(${monto_recibido:g})"
+
+        if pago.folio and pago.folio.strip() != "":
+            pago.folio = f"{pago.folio} y {etiqueta_nuevo_folio}"
+        else:
+            pago.folio = etiqueta_nuevo_folio
         
         db.session.commit()
-        return jsonify({"message": "Cobro asentado correctamente"}), 200
 
+        # 📸 BITÁCORA: Registro de Cobro
+        registrar_accion(
+            id_usuario=obtener_id_admin(),
+            accion="COBRO_REALIZADO",
+            descripcion=f"Cobró ${monto_recibido} por '{estructura.concepto}'. Folio: {folio_ingresado}. Estatus: {estado_nuevo}"
+        )
+
+        return jsonify({"message": f"Cobro exitoso. Estatus: {estado_nuevo}"}), 200
     except Exception as e:
         db.session.rollback()
-        print("🔴 ERROR EN POST /registrar:", str(e))
         return jsonify({"error": str(e)}), 500
 
-# @caja_bp.route("/caja/crear", methods=["POST", "OPTIONS"]) ...
 # ==========================================
 # ➕ API: CREAR UN COBRO DESDE EL MODAL
 # ==========================================
 @caja_bp.route("/caja/crear", methods=["POST", "OPTIONS"])
 def crear_pago_manual():
-    if request.method == "OPTIONS": 
-        return jsonify({}), 200
+    if request.method == "OPTIONS": return jsonify({}), 200
 
     data = request.get_json()
     try:
         alumno = Alumno.query.filter_by(matricula=data['matricula']).first()
-        if not alumno:
-            return jsonify({"error": "Alumno no encontrado"}), 404
+        if not alumno: return jsonify({"error": "Alumno no encontrado"}), 404
         
         tipo_recibido = data.get('categoria') or data.get('tipo')
-        if not tipo_recibido:
-            return jsonify({"error": "Falta el tipo de cobro"}), 400
+        if not tipo_recibido: return jsonify({"error": "Falta el tipo de cobro"}), 400
 
+        ahora = datetime.now()
         nueva_estructura = EstructuraPago(
             id_generacion=alumno.id_generacion,
             tipo=tipo_recibido,
             semestre=data.get('semestre', 1),
             concepto=data['concepto'].upper(),
-            monto=data['monto']
+            monto=data['monto'],
+            mes=data.get('mes', ahora.month), 
+            anio=data.get('anio', ahora.year) 
         )
         db.session.add(nueva_estructura)
         db.session.flush()
@@ -307,13 +394,18 @@ def crear_pago_manual():
         db.session.add(nuevo_pago)
         db.session.commit()
         
-        return jsonify({"message": "Cobro registrado correctamente"}), 201
+        # 📸 BITÁCORA: Cargo Manual
+        registrar_accion(
+            id_usuario=obtener_id_admin(),
+            accion="NUEVO_CARGO_MANUAL",
+            descripcion=f"Creó un cargo manual por '{nueva_estructura.concepto}' (${nueva_estructura.monto}) al alumno {alumno.matricula}"
+        )
 
+        return jsonify({"message": "Cobro registrado correctamente"}), 201
     except Exception as err:
         db.session.rollback()
-        print("🔴 ERROR EN POST /crear:", str(err))
         return jsonify({"error": str(err)}), 500
-# @caja_bp.route("/caja/pago/<int:id_pago>", methods=["PUT", "DELETE", "OPTIONS"]) ...
+
 # ==========================================
 # ✏️ API: EDITAR CUALQUIER DATO DE UN COBRO
 # ==========================================
@@ -325,22 +417,32 @@ def editar_pago(id_pago):
         pago = Pago.query.get(id_pago)
         if not pago: return jsonify({"error": "Pago no encontrado"}), 404
         
-        # 1. Editar Monto y Concepto
         estructura = EstructuraPago.query.get(pago.id_estructura)
+        concepto_anterior = estructura.concepto if estructura else "Desconocido"
+        
         if estructura:
             estructura.concepto = data.get("concepto", estructura.concepto).upper()
             estructura.monto = data.get("monto", estructura.monto)
             
-        # 2. Editar Fecha y Folio (solo si ya estaba pagado)
-        if getattr(pago, 'estado', '') == 'PAGADO' or getattr(pago, 'estatus_pago', '') == 'PAGADO':
+        estado_pago = str(getattr(pago, 'estado', getattr(pago, 'estatus_pago', ''))).upper()
+        if estado_pago in ['PAGADO', 'PARCIAL']:
             if "fecha" in data: pago.fecha_pago = data["fecha"]
             if "folio" in data: pago.folio = data["folio"]
             
         db.session.commit()
+
+        # 📸 BITÁCORA: Editar Pago
+        registrar_accion(
+            id_usuario=obtener_id_admin(),
+            accion="EDITAR_COBRO",
+            descripcion=f"Editó el recibo ID {id_pago} ({concepto_anterior})"
+        )
+
         return jsonify({"message": "Cobro actualizado"}), 200
     except Exception as e:
         db.session.rollback()
         return jsonify({"error": str(e)}), 500
+
 # ==========================================
 # 🗑️ API: ELIMINAR UN COBRO PENDIENTE
 # ==========================================
@@ -351,12 +453,17 @@ def eliminar_pago(id_pago):
         pago = Pago.query.get(id_pago)
         if not pago: return jsonify({"error": "Pago no encontrado"}), 404
         
-        # Eliminamos el recibo pendiente del alumno
         db.session.delete(pago)
         db.session.commit()
+
+        # 📸 BITÁCORA: Eliminar Recibo
+        registrar_accion(
+            id_usuario=obtener_id_admin(),
+            accion="ELIMINAR_RECIBO",
+            descripcion=f"Eliminó el recibo de cobro ID {id_pago} del sistema"
+        )
+
         return jsonify({"message": "Cobro eliminado correctamente"}), 200
     except Exception as e:
         db.session.rollback()
         return jsonify({"error": str(e)}), 500
- 
-    

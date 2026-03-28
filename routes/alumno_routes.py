@@ -3,6 +3,10 @@ from werkzeug.security import generate_password_hash
 from extensions import db
 from models import Alumno, Usuario, EstructuraPago, Pago, Bitacora
 from routes.admin_routes import generar_password_alumno
+from datetime import datetime 
+# 📸 IMPORTAMOS LAS HERRAMIENTAS DE LA BITÁCORA
+from helpers import registrar_accion, obtener_id_admin
+
 alumno_bp = Blueprint('alumno_bp', __name__)
 
 # ==========================
@@ -28,7 +32,9 @@ def listar_alumnos():
                 "id_generacion": a.id_generacion,
                 "nombre_generacion": nombre_gen,
                 "id_grupo": a.id_grupo,
-                "nombre_grupo": nombre_grupo
+                "nombre_grupo": nombre_grupo,
+                "fecha_nacimiento": a.fecha_nacimiento.strftime('%Y-%m-%d') if a.fecha_nacimiento else None,
+                "fecha_baja": a.fecha_baja.strftime('%Y-%m-%d') if a.fecha_baja else None
             })
         return jsonify(resultado), 200
     except Exception as e:
@@ -51,45 +57,37 @@ def registrar_alumno_con_usuario():
         if not fecha_nac_req:
             return jsonify({'error': 'La fecha de nacimiento es obligatoria'}), 400
 
-        # 1. Buscar si ya existe el alumno o el usuario
         alumno_existente = Alumno.query.filter_by(matricula=matricula_req).first()
         usuario_existente = Usuario.query.filter_by(correo=matricula_req).first()
         
         password_creada = generar_password_alumno(nombre_req, apellido_req, fecha_nac_req)
 
-        # 2. LÓGICA DE DETECCIÓN: ¿Es nuevo o es Re-inscripción?
         if alumno_existente:
             if alumno_existente.estatus == 'ACTIVO':
                 return jsonify({'error': 'Esta matrícula ya pertenece a un alumno ACTIVO.'}), 400
             
-            # --- CASO: RE-INSCRIPCIÓN (Estaba en BAJA) ---
-            # Actualizamos sus datos a la nueva realidad
             alumno_existente.nombre = nombre_req
             alumno_existente.apellido = apellido_req
             alumno_existente.fecha_nacimiento = fecha_nac_req
             alumno_existente.id_generacion = id_generacion_req
             alumno_existente.id_grupo = id_grupo_req
             alumno_existente.estatus = 'ACTIVO'
-            alumno_existente.semestre_actual = 1 # Reinicia desde primero
+            alumno_existente.semestre_actual = 1 
+            alumno_existente.fecha_baja = None 
             
-            # Actualizamos su usuario (por si cambió nombre o para resetear pass)
             if usuario_existente:
                 usuario_existente.nombre = f"{nombre_req} {apellido_req}"
                 usuario_existente.contraseña = generate_password_hash(password_creada)
                 usuario_existente.estado = "ACTIVO"
 
-            # 🔥 EL TOQUE MAESTRO: "Limpiar el pasado"
-            # Buscamos todos sus pagos PENDIENTES de la generación vieja y los cancelamos
-            # para que no se sumen a su nueva deuda.
             Pago.query.filter_by(id_alumno=alumno_existente.id_alumno, estado='PENDIENTE').update({
-                'estado': 'CANCELADO' # O 'ANULADO_REINGRESO'
+                'estado': 'CANCELADO' 
             })
             
             target_alumno = alumno_existente
-            mensaje_log = f"RE-INSCRIPCIÓN: Alumno {matricula_req} movido a Gen {id_generacion_req}"
+            mensaje_log = f"RE-INSCRIPCIÓN: Alumno {matricula_req} reingresado a Gen {id_generacion_req}"
 
         else:
-            # --- CASO: REGISTRO NUEVO ---
             nuevo_usuario = Usuario(
                 nombre=f"{nombre_req} {apellido_req}",
                 correo=matricula_req,
@@ -115,10 +113,8 @@ def registrar_alumno_con_usuario():
             db.session.flush()
             
             target_alumno = nuevo_alumno
-            mensaje_log = f"NUEVO ALUMNO: {matricula_req} inscrito"
+            mensaje_log = f"NUEVO ALUMNO: {matricula_req} ({nombre_req} {apellido_req}) inscrito"
 
-        # 3. CARGAR NUEVA ESTRUCTURA DE PAGOS (Aplica para nuevos y reingresos)
-        # Esto le crea su nuevo "plan de pagos" de la generación actual
         estructuras_nuevas = EstructuraPago.query.filter_by(id_generacion=id_generacion_req).all()
         for molde in estructuras_nuevas:
             nuevo_pago = Pago(
@@ -129,8 +125,14 @@ def registrar_alumno_con_usuario():
             )
             db.session.add(nuevo_pago)
         
-        db.session.add(Bitacora(id_usuario=1, accion="INSCRIPCION", descripcion=mensaje_log))
         db.session.commit()
+
+        # 📸 BITÁCORA: Inscripción o Re-inscripción
+        registrar_accion(
+            id_usuario=obtener_id_admin(),
+            accion="INSCRIPCION_ALUMNO",
+            descripcion=mensaje_log
+        )
 
         return jsonify({
             'message': 'Proceso completado con éxito', 
@@ -143,7 +145,7 @@ def registrar_alumno_con_usuario():
         return jsonify({'error': 'Error al procesar la inscripción'}), 500
 
 # ==========================================
-# ✏️ ACTUALIZAR ALUMNO (Lapicito de Edición)
+# ✏️ ACTUALIZAR ALUMNO
 # ==========================================
 @alumno_bp.route("/alumnos/<string:matricula_original>", methods=["PUT", "OPTIONS"])
 def actualizar_estatus_alumno(matricula_original):
@@ -166,10 +168,37 @@ def actualizar_estatus_alumno(matricula_original):
 
         if "nombre" in data: alumno.nombre = data["nombre"]
         if "apellido" in data: alumno.apellido = data["apellido"]
-        if "estatus" in data: alumno.estatus = data["estatus"]
         if "id_grupo" in data: alumno.id_grupo = data["id_grupo"]
 
-        # 🔥 EL FIX: Aceptamos "semestre" o "semestre_actual" para que no falle
+        if "estatus" in data:
+            estatus_nuevo = data["estatus"]
+            
+            if estatus_nuevo == 'BAJA':
+                fecha_baja_str = data.get("fecha_baja")
+                if fecha_baja_str:
+                    fecha_baja = datetime.strptime(fecha_baja_str, "%Y-%m-%d").date()
+                else:
+                    fecha_baja = datetime.now().date()
+                    
+                alumno.fecha_baja = fecha_baja
+                
+                pagos_pendientes = db.session.query(Pago, EstructuraPago).join(
+                    EstructuraPago, Pago.id_estructura == EstructuraPago.id_estructura
+                ).filter(
+                    Pago.id_alumno == alumno.id_alumno,
+                    Pago.estado == 'PENDIENTE',
+                    EstructuraPago.tipo == 'MENSUALIDAD'
+                ).all()
+
+                for p, e in pagos_pendientes:
+                    if e.anio > fecha_baja.year or (e.anio == fecha_baja.year and e.mes > fecha_baja.month):
+                        db.session.delete(p)
+
+            elif estatus_nuevo != 'BAJA' and alumno.estatus == 'BAJA':
+                alumno.fecha_baja = None 
+                
+            alumno.estatus = estatus_nuevo
+
         nuevo_sem_req = data.get("semestre_actual") or data.get("semestre")
         
         if nuevo_sem_req is not None:
@@ -177,14 +206,11 @@ def actualizar_estatus_alumno(matricula_original):
             if nuevo_semestre != alumno.semestre_actual:
                 alumno.semestre_actual = nuevo_semestre 
                 
-                # Buscamos la plantilla que creó el Administrador en Catálogos
                 conceptos = EstructuraPago.query.filter(
                     EstructuraPago.id_generacion == alumno.id_generacion,
                     EstructuraPago.semestre == nuevo_semestre,
                     EstructuraPago.tipo.in_(['INSCRIPCION', 'MENSUALIDAD'])
                 ).all()
-
-                print(f"🔍 Promoviendo a {nuevo_semestre}° SEM. Plantillas encontradas: {len(conceptos)}")
 
                 for c in conceptos:
                     existe_pago = Pago.query.filter_by(id_alumno=alumno.id_alumno, id_estructura=c.id_estructura).first()
@@ -197,13 +223,21 @@ def actualizar_estatus_alumno(matricula_original):
                         ))
 
         db.session.commit()
-        return jsonify({"message": "Datos actualizados y cobros generados"}), 200
+
+        # 📸 BITÁCORA: Modificación de alumno
+        registrar_accion(
+            id_usuario=obtener_id_admin(),
+            accion="EDITAR_ALUMNO",
+            descripcion=f"Modificó la información o el estatus del alumno {alumno.matricula}"
+        )
+
+        return jsonify({"message": "Datos actualizados correctamente"}), 200
     except Exception as e:
         db.session.rollback()
         return jsonify({"error": str(e)}), 500
 
 # ==========================
-# 🚀 PROMOCIÓN MASIVA
+# 🚀 PROMOCIÓN MASIVA (VERSIÓN ORIGINAL LIMPIA)
 # ==========================
 @alumno_bp.route("/alumnos/promocion-masiva", methods=["POST", "OPTIONS"])
 def promocion_masiva():
@@ -214,34 +248,33 @@ def promocion_masiva():
     if not id_gen: return jsonify({"error": "Debes especificar la generación"}), 400
 
     try:
+        # 1. Los de 6to pasan a EGRESADO
         db.session.query(Alumno).filter(
             Alumno.id_generacion == id_gen, Alumno.semestre_actual == 6, Alumno.estatus == 'ACTIVO'
         ).update({Alumno.estatus: 'EGRESADO'}, synchronize_session=False)
 
+        # 2. Los demás suben 1 semestre
         alumnos_a_promover = Alumno.query.filter(
             Alumno.id_generacion == id_gen, Alumno.semestre_actual < 6, Alumno.estatus == 'ACTIVO'
         ).all()
 
+        cantidad_promovidos = len(alumnos_a_promover)
+
         for alumno in alumnos_a_promover:
-            nuevo_semestre = alumno.semestre_actual + 1
-            alumno.semestre_actual = nuevo_semestre
+            alumno.semestre_actual += 1
 
-            conceptos = EstructuraPago.query.filter(
-                EstructuraPago.id_generacion == id_gen,
-                EstructuraPago.semestre == nuevo_semestre,
-                EstructuraPago.tipo.in_(['INSCRIPCION', 'MENSUALIDAD'])
-            ).all()
-
-            for c in conceptos:
-                existe = Pago.query.filter_by(id_alumno=alumno.id_alumno, id_estructura=c.id_estructura).first()
-                if not existe:
-                    db.session.add(Pago(
-                        id_alumno=alumno.id_alumno,
-                        id_estructura=c.id_estructura,
-                        estado='PENDIENTE'
-                    ))
+        # ❌ ELIMINAMOS EL CÓDIGO QUE CREABA PAGOS. 
+        # Ahora solo actualiza el número de semestre, respetando los 18 meses iniciales.
 
         db.session.commit()
+
+        # 📸 BITÁCORA
+        registrar_accion(
+            id_usuario=obtener_id_admin(),
+            accion="PROMOCION_MASIVA",
+            descripcion=f"Promovió masivamente a {cantidad_promovidos} alumnos de la generación ID: {id_gen}"
+        )
+
         return jsonify({"message": "Promoción completada"}), 200
 
     except Exception as e:
@@ -249,7 +282,7 @@ def promocion_masiva():
         return jsonify({"error": str(e)}), 500 
 
 # ==========================
-# 🎯 PROMOCIÓN SELECTIVA
+# 🎯 PROMOCIÓN SELECTIVA (VERSIÓN ORIGINAL LIMPIA)
 # ==========================
 @alumno_bp.route("/alumnos/promocion-selectiva", methods=["POST", "OPTIONS"])
 def promocion_selectiva():
@@ -262,6 +295,7 @@ def promocion_selectiva():
         return jsonify({"error": "Faltan alumnos o semestre de destino"}), 400
 
     try:
+        # 1. Actualizar el semestre
         if semestre_destino > 6:
             db.session.query(Alumno).filter(Alumno.id_alumno.in_(ids_alumnos))\
                 .update({Alumno.estatus: 'EGRESADO', Alumno.semestre_actual: 6}, synchronize_session=False)
@@ -269,29 +303,25 @@ def promocion_selectiva():
             db.session.query(Alumno).filter(Alumno.id_alumno.in_(ids_alumnos))\
                 .update({Alumno.semestre_actual: semestre_destino}, synchronize_session=False)
 
-            for id_alum in ids_alumnos:
-                alumno = Alumno.query.get(id_alum)
-                conceptos = EstructuraPago.query.filter(
-                    EstructuraPago.id_generacion == alumno.id_generacion,
-                    EstructuraPago.semestre == semestre_destino,
-                    EstructuraPago.tipo.in_(['INSCRIPCION', 'MENSUALIDAD'])
-                ).all()
-
-                for c in conceptos:
-                    existe = Pago.query.filter_by(id_alumno=id_alum, id_estructura=c.id_estructura).first()
-                    if not existe:
-                        db.session.add(Pago(
-                            id_alumno=id_alum,
-                            id_estructura=c.id_estructura,
-                            estado='PENDIENTE'
-                        ))
+        # ❌ ELIMINAMOS EL CÓDIGO QUE CREABA PAGOS TAMBIÉN AQUÍ.
 
         db.session.commit()
+
+        # 📸 BITÁCORA
+        registrar_accion(
+            id_usuario=obtener_id_admin(),
+            accion="PROMOCION_SELECTIVA",
+            descripcion=f"Promovió manualmente a {len(ids_alumnos)} alumno(s) al semestre {semestre_destino}"
+        )
+
         return jsonify({"message": f"Promoción a {semestre_destino}° exitosa"}), 200
     except Exception as e:
         db.session.rollback()
         return jsonify({"error": str(e)}), 500
 
+# ==========================
+# ❌ ELIMINAR ALUMNO
+# ==========================
 @alumno_bp.route("/alumnos/<string:matricula>", methods=["DELETE", "OPTIONS"])
 def eliminar_alumno(matricula):
     if request.method == "OPTIONS": return jsonify({}), 200
@@ -308,12 +338,55 @@ def eliminar_alumno(matricula):
             Usuario.query.filter_by(id_usuario=id_usuario_vinculado).delete()
 
         db.session.commit()
+
+        # 📸 BITÁCORA: Borrar alumno
+        registrar_accion(
+            id_usuario=obtener_id_admin(),
+            accion="ELIMINAR_ALUMNO",
+            descripcion=f"Eliminó por completo los registros del alumno con matrícula {matricula}"
+        )
+
         return jsonify({"message": f"Alumno {matricula} eliminado"}), 200
 
     except Exception as e:
         db.session.rollback()
         return jsonify({"error": str(e)}), 500
-    
+
+# ==========================================
+# 🔓 API: LIBERAR MATRÍCULA PARA REINGRESO
+# ==========================================
+@alumno_bp.route("/alumnos/liberar-matricula/<string:matricula>", methods=["POST", "OPTIONS"])
+def liberar_matricula(matricula):
+    if request.method == "OPTIONS": return jsonify({}), 200
+    try:
+        alumno = Alumno.query.filter_by(matricula=matricula).first()
+        if not alumno: 
+            return jsonify({"error": "Alumno no encontrado"}), 404
+            
+        if alumno.estatus != 'BAJA':
+            return jsonify({"error": "El alumno debe estar dado de baja primero."}), 400
+
+        nueva_matricula = f"{matricula}-BAJA"
+        alumno.matricula = nueva_matricula
+
+        usuario_login = Usuario.query.filter_by(correo=matricula).first()
+        if usuario_login:
+            usuario_login.correo = nueva_matricula
+
+        db.session.commit()
+
+        # 📸 BITÁCORA: Liberar Matrícula
+        registrar_accion(
+            id_usuario=obtener_id_admin(),
+            accion="LIBERAR_MATRICULA",
+            descripcion=f"Liberó la matrícula {matricula} cambiándola a {nueva_matricula}"
+        )
+
+        return jsonify({"message": "Matrícula archivada y liberada exitosamente."}), 200
+
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({"error": str(e)}), 500    
 """ from flask import Blueprint, request, jsonify
 from werkzeug.security import generate_password_hash
 from extensions import db
