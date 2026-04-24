@@ -1,5 +1,5 @@
 from extensions import db
-from datetime import datetime, timezone
+from datetime import datetime
 
 class Bitacora(db.Model):
     __tablename__ = 'bitacora'
@@ -8,13 +8,12 @@ class Bitacora(db.Model):
 
     accion = db.Column(db.String(100))
     descripcion = db.Column(db.Text)
-    # ✅ NUEVA COLUMNA
     ip = db.Column(db.String(45)) 
     
+    # 🕒 Quitamos el "timezone.utc" para evitar la hora de Londres
     fecha = db.Column(
         db.DateTime,
-        default=lambda: datetime.now(timezone.utc),
-        onupdate=lambda: datetime.now(timezone.utc)
+        default=datetime.now
     )
     
     usuario = db.relationship('Usuario', back_populates='bitacoras')
