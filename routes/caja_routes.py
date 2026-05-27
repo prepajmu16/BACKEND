@@ -378,13 +378,33 @@ def registrar_cobro_oficial():
     data = request.get_json()
     id_pago = data.get("id_pago")
     fecha_ingresada = data.get("fecha")
-    folio_ingresado = data.get("folio")
+    folio_ingresado = str(data.get("folio", "")).strip()
     
     monto_recibido = float(data.get("monto_recibido", 0))
+
+    if not folio_ingresado:
+        return jsonify({"error": "El folio es obligatorio"}), 400
 
     try:
         pago = Pago.query.get(id_pago)
         if not pago: return jsonify({"error": "Recibo no encontrado"}), 404
+        
+        # 🔎 BÚSQUEDA INTELIGENTE DE FOLIOS DUPLICADOS
+        # Buscamos si el folio ingresado ya existe en algún otro recibo (usando .contains),
+        # PERO filtramos para que solo bloquee si el recibo pertenece a un alumno diferente.
+        folio_en_otro_alumno = Pago.query.filter(
+            Pago.folio.contains(folio_ingresado),
+            Pago.id_alumno != pago.id_alumno
+        ).first()
+
+        if folio_en_otro_alumno:
+            return jsonify({
+                "error": f"El folio '{folio_ingresado}' ya está registrado a nombre de otro estudiante."
+            }), 400
+        
+        # ----------------------------------------------------
+        # Si pasó la validación, seguimos con la lógica original
+        # ----------------------------------------------------
         
         estructura = EstructuraPago.query.get(pago.id_estructura)
         costo_total = float(estructura.monto)

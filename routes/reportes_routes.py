@@ -296,7 +296,18 @@ def corte_caja():
         formato = request.args.get('formato', 'pdf')
         hoy = hoy_mx()
         
-        pagos = db.session.query(Pago, Alumno, EstructuraPago).select_from(Pago).join(Alumno).join(EstructuraPago).filter(Pago.fecha_pago == hoy).all()
+        # 🔥 FIX 1: Creamos el rango de 24 horas para no perder los pagos de la tarde
+        inicio_dia = f"{hoy} 00:00:00"
+        fin_dia = f"{hoy} 23:59:59"
+        
+        # 🔥 FIX 2: Aplicamos el between y ordenamos cronológicamente
+        pagos = db.session.query(Pago, Alumno, EstructuraPago)\
+            .select_from(Pago)\
+            .join(Alumno)\
+            .join(EstructuraPago)\
+            .filter(Pago.fecha_pago.between(inicio_dia, fin_dia))\
+            .order_by(Pago.fecha_pago.asc())\
+            .all()
         
         def formato_folio(p):
             folio_str = str(p.folio or "S/F")
@@ -319,7 +330,7 @@ def corte_caja():
         try: registrar_accion(operador.get('id'), "DESCARGA_CORTE_CAJA", f"Descargó el Corte de Caja del día de hoy en formato {formato.upper()}")
         except: pass
 
-        mensaje_vacio = "No existen ingresos registrados para el día de hoy." # 🔥 Mensaje personalizado
+        mensaje_vacio = "No existen ingresos registrados para el día de hoy." 
 
         if formato == 'excel': 
             if data: data.append({"Folio": "", "Alumno": "", "Concepto": "TOTAL DEL DÍA", "Monto": "${:,.2f}".format(total_suma)})
@@ -327,8 +338,7 @@ def corte_caja():
             
         return generar_pdf_generico_pro(f"CORTE DE CAJA DIARIO", data, colors.HexColor("#1E293B"), "Corte.pdf", total_suma=total_suma, titulo_total="TOTAL INGRESOS DEL DÍA", mensaje_vacio=mensaje_vacio)
     except Exception as e: return jsonify({"error": str(e)}), 500
-
-
+    
 @reportes_bp.route("/reportes/ingresos", methods=["GET", "OPTIONS"])
 def reporte_ingresos():
     if request.method == "OPTIONS": return jsonify({}), 200
@@ -348,7 +358,19 @@ def reporte_ingresos():
         try: registrar_accion(operador.get('id'), "DESCARGA_INGRESOS", f"Descargó histórico de ingresos ({inicio} a {fin}) en formato {formato.upper()}")
         except: pass
 
-        pagos = db.session.query(Pago, Alumno, EstructuraPago).select_from(Pago).join(Alumno).join(EstructuraPago).filter(Pago.fecha_pago.between(inicio, fin)).all()
+        # 🔥 FIX 1: Forzamos la fecha final para que cubra hasta el último segundo del día.
+        # Esto evita que se corten los pagos de la tarde o se filtren días incorrectos por UTC.
+        fecha_fin_completa = f"{fin} 23:59:59"
+
+        # 🔥 FIX 2: Agregamos el '.order_by(Pago.fecha_pago.asc())'
+        # Esto garantiza que el PDF siempre empiece por el más viejo y termine con el más nuevo.
+        pagos = db.session.query(Pago, Alumno, EstructuraPago)\
+            .select_from(Pago)\
+            .join(Alumno)\
+            .join(EstructuraPago)\
+            .filter(Pago.fecha_pago.between(inicio, fecha_fin_completa))\
+            .order_by(Pago.fecha_pago.asc())\
+            .all()
         
         data = []
         total_suma = 0 
@@ -363,7 +385,7 @@ def reporte_ingresos():
                     "Monto": "${:,.2f}".format(monto_real)
                 })
         
-        mensaje_vacio = f"No existen ingresos registrados en el periodo del {inicio} al {fin}." # 🔥 Mensaje personalizado
+        mensaje_vacio = f"No existen ingresos registrados en el periodo del {inicio} al {fin}." 
 
         if formato == 'excel': 
             if data: data.append({"Fecha": "", "Alumno": "", "Concepto": "TOTAL INGRESOS", "Monto": "${:,.2f}".format(total_suma)})
@@ -371,7 +393,6 @@ def reporte_ingresos():
             
         return generar_pdf_generico_pro(f"HISTÓRICO DE INGRESOS ({inicio} al {fin})", data, colors.HexColor("#1E293B"), "Historico.pdf", total_suma=total_suma, titulo_total="TOTAL GENERAL DE INGRESOS", mensaje_vacio=mensaje_vacio)
     except Exception as e: return jsonify({"error": str(e)}), 500
-
 
 @reportes_bp.route("/reportes/deudores", methods=["GET", "OPTIONS"])
 def reporte_deudores():

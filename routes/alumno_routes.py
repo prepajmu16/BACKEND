@@ -196,6 +196,12 @@ def actualizar_estatus_alumno(matricula_original):
         if "nombre" in data: alumno.nombre = data["nombre"]
         if "apellido" in data: alumno.apellido = data["apellido"]
         if "id_grupo" in data: alumno.id_grupo = data["id_grupo"]
+        
+        # 🔥 AQUÍ ESTÁ LA CORRECCIÓN: ATARAPAMOS Y GUARDAMOS LA FECHA DE NACIMIENTO
+        if "fecha_nacimiento" in data and data["fecha_nacimiento"]:
+            # Tomamos solo la parte de la fecha (YYYY-MM-DD) por si Angular envía tiempo extra
+            fecha_str = data["fecha_nacimiento"].split('T')[0]
+            alumno.fecha_nacimiento = datetime.strptime(fecha_str, "%Y-%m-%d").date()
 
         if "estatus" in data:
             estatus_nuevo = data["estatus"]
@@ -534,7 +540,6 @@ def obtener_mi_estado_cuenta():
     except Exception as e:
         print(f"🔴 Error interno en mi-estado-cuenta: {str(e)}")
         return jsonify({"message": "Error interno del servidor", "detalle": str(e)}), 500
-
 
 """ 2 from flask import Blueprint, request, jsonify
 from werkzeug.security import generate_password_hash

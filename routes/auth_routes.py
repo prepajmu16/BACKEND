@@ -2,17 +2,17 @@ from flask import Blueprint, request, jsonify
 from flask_jwt_extended import create_access_token, jwt_required, get_jwt, get_jwt_identity, verify_jwt_in_request
 from werkzeug.security import generate_password_hash, check_password_hash
 from extensions import db
-from models import Usuario
+from models import Usuario, Alumno
 from helpers import registrar_accion
 
 auth_bp = Blueprint('auth_bp', __name__)
 
 # ==========================================
-# 🚪 INICIAR SESIÓN
+# 🚪 INICIAR SESIÓN (Versión Corregida con 'estatus')
 # ==========================================
 @auth_bp.route("/login", methods=["POST", "OPTIONS"])
 def login():
-    if request.method == "OPTIONS": return jsonify({}), 200 # Escudo CORS
+    if request.method == "OPTIONS": return jsonify({}), 200 
     
     data = request.get_json()
     identificador = data.get("correo") 
@@ -22,7 +22,27 @@ def login():
     
     if usuario and check_password_hash(usuario.contraseña, contraseña_entrada):
         
-        # 🔥 EL TOKEN: identity es un String, los datos van en additional_claims
+        # 1. Normalizamos el estado de la tabla Usuario (opcional, si también lo usas ahí)
+        estado_usuario = str(usuario.estado).strip().upper() if usuario.estado else ""
+
+        # 2. 🛡️ FILTRO DE SEGURIDAD PARA ALUMNOS
+        if usuario.rol == 'ALUMNO':
+            # Buscamos al alumno por su matrícula
+            alumno = Alumno.query.filter_by(matricula=usuario.correo).first()
+            
+            if alumno:
+                # 🔥 USAMOS EL NOMBRE CORRECTO: .estatus
+                estado_real = str(alumno.estatus).strip().upper() if alumno.estatus else ""
+                
+                # Lista de palabras permitidas para entrar
+                ESTADOS_PERMITIDOS = ['ACTIVO', 'ACTIVA', 'INSCRITO']
+
+                if estado_real not in ESTADOS_PERMITIDOS:
+                    return jsonify({
+                        "message": f"Acceso restringido. Tu estatus actual es: {estado_real}. Acude a Control Escolar."
+                    }), 403 # 403 = Prohibido (Baja)
+
+        # Si pasó el filtro o no es alumno, generamos el token
         access_token = create_access_token(
             identity=str(usuario.id_usuario), 
             additional_claims={
@@ -32,23 +52,21 @@ def login():
             }
         )
         
-        # 📸 BITÁCORA: Registro de inicio de sesión
         registrar_accion(
             id_usuario=usuario.id_usuario,
             accion="LOGIN",
-            descripcion=f"El usuario {usuario.nombre} ({usuario.correo}) inició sesión en el sistema."
+            descripcion=f"El usuario {usuario.nombre} inició sesión."
         )
 
         return jsonify({
             "message": "Bienvenido", 
             "token": access_token, 
             "rol": usuario.rol, 
-            "usuario": usuario.nombre, 
+            "nombre": usuario.nombre, 
             "correo": usuario.correo
         }), 200
         
     return jsonify({"message": "Usuario/Matrícula o contraseña incorrectos"}), 401
-
 # ==========================================
 # 🔒 CERRAR SESIÓN
 # ==========================================
