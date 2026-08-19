@@ -30,7 +30,13 @@ jwt = JWTManager(app)
 # ==========================
 CORS(app, resources={
     r"/api/*": {
-        "origins": ["http://localhost:4200"],
+        "origins": [
+            "http://localhost:4200",
+            "http://192.168.1.108:4200",
+            "http://192.168.1.108",
+            "http://192.168.100.11:4200",
+            "http://192.168.100.11"],
+                
         "allow_headers": ["Authorization", "Content-Type"],
         "methods": ["GET", "POST", "PUT", "DELETE", "OPTIONS"]
     }
@@ -85,7 +91,7 @@ with app.app_context():
     crear_admin_inicial()  # 👈 Se ejecuta aquí, una vez al arrancar
  
 if __name__ == "__main__":
-    app.run(debug=True, port=5000) 
+    app.run(host="0.0.0.0",port=5000, debug=True) 
 
 """ from flask import Flask, jsonify
 from flask_cors import CORS

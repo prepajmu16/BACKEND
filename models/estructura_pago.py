@@ -11,6 +11,8 @@ class EstructuraPago(db.Model):
     mes = db.Column(db.Integer)
     anio = db.Column(db.Integer)  
     monto = db.Column(db.Numeric(10, 2), nullable=False)
+    oportunidad = db.Column(db.String(20), nullable=True, default='1ra Oportunidad')  # ← esto
+
 
     generacion = db.relationship('Generacion', back_populates='estructuras')
     pagos = db.relationship('Pago', back_populates='estructura')

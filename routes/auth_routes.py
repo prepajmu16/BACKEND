@@ -8,7 +8,7 @@ from helpers import registrar_accion
 auth_bp = Blueprint('auth_bp', __name__)
 
 # ==========================================
-# 🚪 INICIAR SESIÓN (Versión Corregida con 'estatus')
+# 🚪 INICIAR SESIÓN (Filtro Activo para Todos)
 # ==========================================
 @auth_bp.route("/login", methods=["POST", "OPTIONS"])
 def login():
@@ -22,19 +22,18 @@ def login():
     
     if usuario and check_password_hash(usuario.contraseña, contraseña_entrada):
         
-        # 1. Normalizamos el estado de la tabla Usuario (opcional, si también lo usas ahí)
+        # 1. 🛡️ FILTRO DE ESTADO PARA USUARIOS DEL SISTEMA (Personal)
         estado_usuario = str(usuario.estado).strip().upper() if usuario.estado else ""
+        if usuario.rol != 'ALUMNO' and estado_usuario not in ['ACTIVO', 'ACTIVA']:
+            return jsonify({
+                "message": f"Tu cuenta de personal está {estado_usuario}. Contacta a SISTEMAS."
+            }), 403
 
         # 2. 🛡️ FILTRO DE SEGURIDAD PARA ALUMNOS
         if usuario.rol == 'ALUMNO':
-            # Buscamos al alumno por su matrícula
             alumno = Alumno.query.filter_by(matricula=usuario.correo).first()
-            
             if alumno:
-                # 🔥 USAMOS EL NOMBRE CORRECTO: .estatus
                 estado_real = str(alumno.estatus).strip().upper() if alumno.estatus else ""
-                
-                # Lista de palabras permitidas para entrar
                 ESTADOS_PERMITIDOS = ['ACTIVO', 'ACTIVA', 'INSCRITO']
 
                 if estado_real not in ESTADOS_PERMITIDOS:
@@ -42,7 +41,7 @@ def login():
                         "message": f"Acceso restringido. Tu estatus actual es: {estado_real}. Acude a Control Escolar."
                     }), 403 # 403 = Prohibido (Baja)
 
-        # Si pasó el filtro o no es alumno, generamos el token
+        # 3. Generamos el token
         access_token = create_access_token(
             identity=str(usuario.id_usuario), 
             additional_claims={
@@ -67,6 +66,7 @@ def login():
         }), 200
         
     return jsonify({"message": "Usuario/Matrícula o contraseña incorrectos"}), 401
+
 # ==========================================
 # 🔒 CERRAR SESIÓN
 # ==========================================
@@ -118,12 +118,12 @@ def actualizar_password():
     try: verify_jwt_in_request()
     except Exception: return jsonify({"status": "error", "mensaje": "Sesión inválida o token ausente"}), 401
 
-    # 🛡️ SEGURIDAD: Sacamos el ID directo del Token, no de lo que mande Angular
+    # 🛡️ SEGURIDAD: Sacamos el ID directo del Token
     current_user_id = get_jwt_identity()
 
     try:
         data = request.get_json()
-        usuario = Usuario.query.get(current_user_id) # Búsqueda 100% segura
+        usuario = Usuario.query.get(current_user_id) 
         
         if not usuario: return jsonify({"status": "error", "mensaje": "Usuario no encontrado"}), 404
         if not check_password_hash(usuario.contraseña, data.get('passActual')): 
@@ -145,7 +145,7 @@ def actualizar_password():
         return jsonify({"status": "error", "mensaje": "Error en servidor"}), 500 
 
 # ==========================================
-# 📝 ACTUALIZAR DATOS DEL PERFIL
+# 📝 ACTUALIZAR DATOS DEL PERFIL (Con renovación de Token)
 # ==========================================
 @auth_bp.route('/actualizar_perfil', methods=['PUT', 'OPTIONS'])
 def actualizar_perfil():
@@ -159,13 +159,12 @@ def actualizar_perfil():
 
     try:
         data = request.get_json()
-        usuario = Usuario.query.get(current_user_id) # Búsqueda 100% segura
+        usuario = Usuario.query.get(current_user_id) 
         
         if not usuario: return jsonify({"status": "error", "mensaje": "Usuario no encontrado"}), 404
         
         nuevo_correo = data.get('correo')
         
-        # Validar si el nuevo correo ya le pertenece a OTRA persona
         if nuevo_correo != usuario.correo and Usuario.query.filter_by(correo=nuevo_correo).first():
             return jsonify({"status": "error", "mensaje": "El correo ya está en uso por otro usuario"}), 400
 
@@ -177,6 +176,16 @@ def actualizar_perfil():
         
         db.session.commit()
 
+        # 🔥 RENOVACIÓN DEL TOKEN: Devolvemos un nuevo token para que Angular actualice los datos en pantalla
+        nuevo_token = create_access_token(
+            identity=str(usuario.id_usuario), 
+            additional_claims={
+                "id": usuario.id_usuario, 
+                "rol": usuario.rol, 
+                "nombre": usuario.nombre # <--- Ahora el token ya trae el nombre nuevo
+            }
+        )
+
         # 📸 BITÁCORA
         registrar_accion(
             id_usuario=usuario.id_usuario,
@@ -184,11 +193,15 @@ def actualizar_perfil():
             descripcion=f"El usuario {correo_original} actualizó su información. Nuevo correo: {usuario.correo}, Nombre: {usuario.nombre}."
         )
 
-        return jsonify({"status": "success", "mensaje": "Perfil actualizado"}), 200
+        return jsonify({
+            "status": "success", 
+            "mensaje": "Perfil actualizado", 
+            "token": nuevo_token # ✅ Se lo mandamos a Angular
+        }), 200
     except Exception as e:
         db.session.rollback()
         return jsonify({"status": "error", "mensaje": "Error en servidor"}), 500
-
+    
 """ from flask import Blueprint, request, jsonify
 from flask_jwt_extended import create_access_token, jwt_required, get_jwt, get_jwt_identity, verify_jwt_in_request
 from werkzeug.security import generate_password_hash, check_password_hash

@@ -4,6 +4,8 @@ from models import Generacion, Grupo, EstructuraPago, Alumno
 from datetime import datetime
 import re
 from helpers import registrar_accion, obtener_id_admin
+from sqlalchemy.orm import joinedload  # 🔥 NUEVO: Importación vital para el rendimiento
+
 # 🛡️ IMPORTAMOS EL ESCUDO DE SEGURIDAD
 from flask_jwt_extended import verify_jwt_in_request, get_jwt
 
@@ -109,7 +111,8 @@ def listar_generaciones():
     if operador.get('rol') not in ['SISTEMAS', 'ADMIN', 'LECTURA']:
         return jsonify({"error": "Acceso denegado"}), 403
 
-    generaciones = Generacion.query.all()
+    # 🔥 OPTIMIZACIÓN: Evitamos consultas N+1 trayendo a los alumnos de antemano
+    generaciones = Generacion.query.options(joinedload(Generacion.alumnos)).all()
     resultado = []
     
     for g in generaciones:
@@ -264,7 +267,8 @@ def listar_grupos():
     if operador.get('rol') not in ['SISTEMAS', 'ADMIN', 'LECTURA']:
         return jsonify({"error": "Acceso denegado"}), 403
 
-    grupos = Grupo.query.all()
+    # 🔥 OPTIMIZACIÓN: Cargamos la relación de alumnos y generación de una sola vez
+    grupos = Grupo.query.options(joinedload(Grupo.alumnos), joinedload(Grupo.generacion)).all()
     resultado = []
     
     for g in grupos:
@@ -275,8 +279,8 @@ def listar_grupos():
         alumnos_activos = [a for a in g.alumnos if a.estatus == 'ACTIVO']
         if alumnos_activos:
             activos = len(alumnos_activos)
-            # Buscamos el semestre más alto en el que estén registrados los alumnos activos
-            semestre_calculado = max(a.semestre_actual for a in alumnos_activos)
+            # Buscamos el semestre más alto (protegido por si alguno tiene None)
+            semestre_calculado = max((a.semestre_actual or 1) for a in alumnos_activos)
 
         resultado.append({
             "id_grupo": g.id_grupo,
@@ -430,7 +434,7 @@ def eliminar_generacion(id_generacion):
     except Exception as e:
         db.session.rollback()
         return jsonify({"error": str(e)}), 500
-
+    
 """ from flask import Blueprint, request, jsonify
 from extensions import db
 from models import Generacion, Grupo, EstructuraPago, Alumno

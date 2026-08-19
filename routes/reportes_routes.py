@@ -3,13 +3,18 @@ import io
 import os
 import pandas as pd
 import traceback
+import platform
 from datetime import datetime, date
 from sqlalchemy import func 
 from extensions import db
+
+# 📚 MODELOS
 from models.pago import Pago
 from models.alumno import Alumno
 from models.estructura_pago import EstructuraPago
 from models.grupo import Grupo 
+from models.abonos_pago import AbonoPago
+
 from helpers import registrar_accion, obtener_id_admin
 import subprocess
 
@@ -45,7 +50,7 @@ def limpiar_param(val):
     if val in [None, "null", "undefined", "", "Todos", "0"]: return None
     return val
 
-# 🕒 FUNCIONES MAESTRAS PARA OBTENER LA HORA DE MÉXICO EN ESTE ARCHIVO
+# 🕒 FUNCIONES MAESTRAS PARA OBTENER LA HORA DE MÉXICO
 def ahora_mx():
     return datetime.now(ZoneInfo("America/Mexico_City"))
 
@@ -62,7 +67,7 @@ def pie_de_pagina(canvas, doc):
     p.drawOn(canvas, letter[0]/2 - 80, 20)
     canvas.restoreState()
 
-# --- 2. ENCABEZADO OFICIAL (ALINEACIÓN PERFECTA) ---
+# --- 2. ENCABEZADO OFICIAL ---
 def crear_encabezado_logo(elementos, titulo_reporte, estilos):
     try:
         if os.path.exists(RUTA_LOGO):
@@ -118,7 +123,7 @@ def crear_encabezado_logo(elementos, titulo_reporte, estilos):
     elementos.append(Spacer(1, 15))
 
 # --- 3. MOTOR PDF DEUDORES ---
-def generar_pdf_deudores_pro(data_agrupada, titulo_str, nombre_archivo, mensaje_vacio="No hay registros."):
+def generar_pdf_deudores_pro(data_agrupada, titulo_str, nombre_archivo, mensaje_vacio="No hay registros.", descargar=True, es_individual=False):
     buffer = io.BytesIO()
     doc = SimpleDocTemplate(buffer, pagesize=letter, title=titulo_str,
                             rightMargin=40, leftMargin=40, topMargin=40, bottomMargin=40)
@@ -127,10 +132,9 @@ def generar_pdf_deudores_pro(data_agrupada, titulo_str, nombre_archivo, mensaje_
     crear_encabezado_logo(elementos, titulo_str, estilos)
     
     if not data_agrupada:
-        # 🔥 MENSAJE ELEGANTE SI NO HAY DATOS
         estilo_aviso = estilos['Normal']
         estilo_aviso.fontSize = 12
-        estilo_aviso.textColor = colors.HexColor("#475569") # Gris oscuro
+        estilo_aviso.textColor = colors.HexColor("#475569")
         elementos.append(Paragraph(f"<i>{mensaje_vacio}</i>", estilo_aviso))
     else:
         total_general = 0
@@ -139,10 +143,9 @@ def generar_pdf_deudores_pro(data_agrupada, titulo_str, nombre_archivo, mensaje_
         estilo_nombre.leftIndent = 0
 
         for alu in data_agrupada:
-            bloque = []
             nombre_str = f"<font color='#0f172a'><b>{alu['Alumno']}</b></font> — <font color='#b91c1c'><b>{alu['Matrícula']}</b></font>"
-            bloque.append(Paragraph(nombre_str, estilo_nombre))
-            bloque.append(Spacer(1, 5))
+            p_nombre = Paragraph(nombre_str, estilo_nombre)
+            espacio = Spacer(1, 5)
             
             tabla_data = [["Concepto", "Monto Restante"]] 
             for c in alu["Conceptos"]:
@@ -150,7 +153,8 @@ def generar_pdf_deudores_pro(data_agrupada, titulo_str, nombre_archivo, mensaje_
             tabla_data.append(["TOTAL ADEUDO", "${:,.2f}".format(alu['Total'])])
             total_general += alu["Total"]
             
-            t = Table(tabla_data, colWidths=[460, 70], hAlign='LEFT')
+            # 🔥 Agregado repeatRows=1 por si la tabla se divide en dos hojas
+            t = Table(tabla_data, colWidths=[460, 70], hAlign='LEFT', repeatRows=1)
             t.setStyle(TableStyle([
                 ('BACKGROUND', (0,0), (-1,0), colors.HexColor("#b91c1c")), 
                 ('TEXTCOLOR', (0,0), (-1,0), colors.whitesmoke),
@@ -160,9 +164,20 @@ def generar_pdf_deudores_pro(data_agrupada, titulo_str, nombre_archivo, mensaje_
                 ('BACKGROUND', (0,-1), (-1,-1), colors.whitesmoke),
                 ('TEXTCOLOR', (0,-1), (-1,-1), colors.HexColor("#b91c1c")),
             ]))
-            bloque.append(t)
-            bloque.append(Spacer(1, 15))
-            elementos.append(KeepTogether(bloque))
+            
+            # 🔥 Aquí controlamos si usamos KeepTogether o lo dejamos fluir
+            if es_individual:
+                elementos.append(p_nombre)
+                elementos.append(espacio)
+                elementos.append(t)
+                elementos.append(Spacer(1, 15))
+            else:
+                bloque = []
+                bloque.append(p_nombre)
+                bloque.append(espacio)
+                bloque.append(t)
+                bloque.append(Spacer(1, 15))
+                elementos.append(KeepTogether(bloque))
             
         elementos.append(Spacer(1, 20))
         estilo_total = estilos['Normal']
@@ -171,7 +186,9 @@ def generar_pdf_deudores_pro(data_agrupada, titulo_str, nombre_archivo, mensaje_
     
     doc.build(elementos, onFirstPage=pie_de_pagina, onLaterPages=pie_de_pagina)
     buffer.seek(0)
-    return send_file(buffer, mimetype='application/pdf', as_attachment=True, download_name=nombre_archivo)
+    
+    # 🔥 AQUÍ APLICAMOS LA VARIABLE: as_attachment=descargar
+    return send_file(buffer, mimetype='application/pdf', as_attachment=descargar, download_name=nombre_archivo)
 
 # --- 4. MOTOR PDF GENÉRICO CON TOTALIZADOR ---
 def generar_pdf_generico_pro(titulo_str, data, color_tema, nombre_archivo, total_suma=None, titulo_total="TOTAL", mensaje_vacio="No se encontraron registros."):
@@ -183,7 +200,6 @@ def generar_pdf_generico_pro(titulo_str, data, color_tema, nombre_archivo, total
     crear_encabezado_logo(elementos, titulo_str, estilos)
     
     if not data:
-        # 🔥 MENSAJE ELEGANTE SI NO HAY DATOS
         estilo_aviso = estilos['Normal']
         estilo_aviso.fontSize = 12
         estilo_aviso.textColor = colors.HexColor("#475569")
@@ -220,7 +236,6 @@ def generar_pdf_generico_pro(titulo_str, data, color_tema, nombre_archivo, total
         t.setStyle(estilo_tabla)
         elementos.append(t)
         
-        # AGREGAMOS EL BLOQUE DEL TOTAL COMO EN DEUDORES
         if total_suma is not None:
             elementos.append(Spacer(1, 20))
             estilo_total = estilos['Normal']
@@ -233,7 +248,6 @@ def generar_pdf_generico_pro(titulo_str, data, color_tema, nombre_archivo, total
 
 # --- 5. EXCEL PRO ---
 def generar_excel(data, nombre_hoja, nombre_archivo, mensaje_vacio="No hay información para mostrar"):
-    # 🔥 AHORA EL EXCEL TAMBIÉN MUESTRA UN AVISO ELEGANTE
     df = pd.DataFrame(data) if data else pd.DataFrame([{"Aviso": mensaje_vacio}])
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine='openpyxl') as writer:
@@ -266,19 +280,23 @@ def dashboard_ingresos():
         return jsonify({"error": "Acceso denegado"}), 403
 
     try:
-        hoy = hoy_mx(); p_mes = hoy.replace(day=1)
+        hoy_str = hoy_mx().strftime("%Y-%m-%d")
+        inicio_hoy = f"{hoy_str} 00:00:00"
+        fin_hoy = f"{hoy_str} 23:59:59"
         
-        pagos_hoy = db.session.query(Pago, EstructuraPago).join(EstructuraPago).filter(
-            Pago.fecha_pago == hoy, Pago.estado.in_(['PAGADO', 'PARCIAL'])).all()
+        p_mes_str = hoy_mx().replace(day=1).strftime("%Y-%m-%d")
+        inicio_mes = f"{p_mes_str} 00:00:00"
+
+        suma_hoy = db.session.query(func.sum(AbonoPago.monto_abono))\
+            .filter(AbonoPago.fecha_abono.between(inicio_hoy, fin_hoy)).scalar() or 0.0
             
-        pagos_mes = db.session.query(Pago, EstructuraPago).join(EstructuraPago).filter(
-            Pago.fecha_pago >= p_mes, Pago.fecha_pago <= hoy, Pago.estado.in_(['PAGADO', 'PARCIAL'])).all()
+        suma_mes = db.session.query(func.sum(AbonoPago.monto_abono))\
+            .filter(AbonoPago.fecha_abono.between(inicio_mes, fin_hoy)).scalar() or 0.0
 
-        suma_hoy = sum([float(p.monto_abonado) if p.monto_abonado else float(e.monto or 0) for p, e in pagos_hoy])
-        suma_mes = sum([float(p.monto_abonado) if p.monto_abonado else float(e.monto or 0) for p, e in pagos_mes])
-
-        return jsonify({"ingresos_hoy": suma_hoy, "ingresos_mes": suma_mes})
-    except Exception as e: return jsonify({"error": "Dashboard error"}), 500
+        return jsonify({"ingresos_hoy": float(suma_hoy), "ingresos_mes": float(suma_mes)})
+    except Exception as e: 
+        print("ERROR DASHBOARD:", str(e))
+        return jsonify({"error": "Dashboard error"}), 500
 
 
 @reportes_bp.route("/reportes/corte-caja", methods=["GET", "OPTIONS"])
@@ -294,38 +312,30 @@ def corte_caja():
 
     try:
         formato = request.args.get('formato', 'pdf')
-        hoy = hoy_mx()
         
-        # 🔥 FIX 1: Creamos el rango de 24 horas para no perder los pagos de la tarde
-        inicio_dia = f"{hoy} 00:00:00"
-        fin_dia = f"{hoy} 23:59:59"
+        hoy_str = hoy_mx().strftime("%Y-%m-%d")
+        inicio_hoy = f"{hoy_str} 00:00:00"
+        fin_hoy = f"{hoy_str} 23:59:59"
         
-        # 🔥 FIX 2: Aplicamos el between y ordenamos cronológicamente
-        pagos = db.session.query(Pago, Alumno, EstructuraPago)\
-            .select_from(Pago)\
-            .join(Alumno)\
-            .join(EstructuraPago)\
-            .filter(Pago.fecha_pago.between(inicio_dia, fin_dia))\
-            .order_by(Pago.fecha_pago.asc())\
+        abonos = db.session.query(AbonoPago, Pago, Alumno, EstructuraPago)\
+            .join(Pago, AbonoPago.id_pago == Pago.id_pago)\
+            .join(Alumno, Pago.id_alumno == Alumno.id_alumno)\
+            .join(EstructuraPago, Pago.id_estructura == EstructuraPago.id_estructura)\
+            .filter(AbonoPago.fecha_abono.between(inicio_hoy, fin_hoy))\
+            .order_by(AbonoPago.id_abono.asc())\
             .all()
         
-        def formato_folio(p):
-            folio_str = str(p.folio or "S/F")
-            if p.estado == 'PARCIAL': return folio_str
-            return folio_str.split('(')[0].strip()
-
         data = []
         total_suma = 0 
-        for p, a, e in pagos:
-            monto_real = float(p.monto_abonado) if p.monto_abonado else float(e.monto or 0)
-            if p.estado == 'PAGADO' or monto_real > 0:
-                total_suma += monto_real
-                data.append({
-                    "Folio": formato_folio(p), 
-                    "Alumno": f"{a.apellido} {a.nombre}".upper(), 
-                    "Concepto": e.concepto, 
-                    "Monto": "${:,.2f}".format(monto_real)
-                })
+        for abono, p, a, e in abonos:
+            monto_real = float(abono.monto_abono)
+            total_suma += monto_real
+            data.append({
+                "Folio": abono.folio, 
+                "Alumno": f"{a.apellido} {a.nombre}".upper(), 
+                "Concepto": e.concepto, 
+                "Monto": "${:,.2f}".format(monto_real)
+            })
         
         try: registrar_accion(operador.get('id'), "DESCARGA_CORTE_CAJA", f"Descargó el Corte de Caja del día de hoy en formato {formato.upper()}")
         except: pass
@@ -334,7 +344,7 @@ def corte_caja():
 
         if formato == 'excel': 
             if data: data.append({"Folio": "", "Alumno": "", "Concepto": "TOTAL DEL DÍA", "Monto": "${:,.2f}".format(total_suma)})
-            return generar_excel(data, "Corte", f"Corte_{hoy}.xlsx", mensaje_vacio)
+            return generar_excel(data, "Corte", f"Corte_{hoy_str}.xlsx", mensaje_vacio)
             
         return generar_pdf_generico_pro(f"CORTE DE CAJA DIARIO", data, colors.HexColor("#1E293B"), "Corte.pdf", total_suma=total_suma, titulo_total="TOTAL INGRESOS DEL DÍA", mensaje_vacio=mensaje_vacio)
     except Exception as e: return jsonify({"error": str(e)}), 500
@@ -358,32 +368,28 @@ def reporte_ingresos():
         try: registrar_accion(operador.get('id'), "DESCARGA_INGRESOS", f"Descargó histórico de ingresos ({inicio} a {fin}) en formato {formato.upper()}")
         except: pass
 
-        # 🔥 FIX 1: Forzamos la fecha final para que cubra hasta el último segundo del día.
-        # Esto evita que se corten los pagos de la tarde o se filtren días incorrectos por UTC.
-        fecha_fin_completa = f"{fin} 23:59:59"
+        inicio_completo = f"{inicio} 00:00:00"
+        fin_completo = f"{fin} 23:59:59"
 
-        # 🔥 FIX 2: Agregamos el '.order_by(Pago.fecha_pago.asc())'
-        # Esto garantiza que el PDF siempre empiece por el más viejo y termine con el más nuevo.
-        pagos = db.session.query(Pago, Alumno, EstructuraPago)\
-            .select_from(Pago)\
-            .join(Alumno)\
-            .join(EstructuraPago)\
-            .filter(Pago.fecha_pago.between(inicio, fecha_fin_completa))\
-            .order_by(Pago.fecha_pago.asc())\
+        abonos = db.session.query(AbonoPago, Pago, Alumno, EstructuraPago)\
+            .join(Pago, AbonoPago.id_pago == Pago.id_pago)\
+            .join(Alumno, Pago.id_alumno == Alumno.id_alumno)\
+            .join(EstructuraPago, Pago.id_estructura == EstructuraPago.id_estructura)\
+            .filter(AbonoPago.fecha_abono.between(inicio_completo, fin_completo))\
+            .order_by(AbonoPago.fecha_abono.asc(), AbonoPago.id_abono.asc())\
             .all()
         
         data = []
         total_suma = 0 
-        for p, a, e in pagos:
-            monto_real = float(p.monto_abonado) if p.monto_abonado else float(e.monto or 0)
-            if p.estado == 'PAGADO' or monto_real > 0:
-                total_suma += monto_real
-                data.append({
-                    "Fecha": p.fecha_pago.strftime("%d/%m/%Y"), 
-                    "Alumno": f"{a.apellido} {a.nombre}".upper(), 
-                    "Concepto": e.concepto, 
-                    "Monto": "${:,.2f}".format(monto_real)
-                })
+        for abono, p, a, e in abonos:
+            monto_real = float(abono.monto_abono)
+            total_suma += monto_real
+            data.append({
+                "Fecha": abono.fecha_abono.strftime("%d/%m/%Y"), 
+                "Alumno": f"{a.apellido} {a.nombre}".upper(), 
+                "Concepto": e.concepto, 
+                "Monto": "${:,.2f}".format(monto_real)
+            })
         
         mensaje_vacio = f"No existen ingresos registrados en el periodo del {inicio} al {fin}." 
 
@@ -391,7 +397,7 @@ def reporte_ingresos():
             if data: data.append({"Fecha": "", "Alumno": "", "Concepto": "TOTAL INGRESOS", "Monto": "${:,.2f}".format(total_suma)})
             return generar_excel(data, "Ingresos", "Historico_Ingresos.xlsx", mensaje_vacio)
             
-        return generar_pdf_generico_pro(f"HISTÓRICO DE INGRESOS ({inicio} al {fin})", data, colors.HexColor("#1E293B"), "Historico.pdf", total_suma=total_suma, titulo_total="TOTAL GENERAL DE INGRESOS", mensaje_vacio=mensaje_vacio)
+        return generar_pdf_generico_pro(f"HISTORIAL DE INGRESOS ({inicio} al {fin})", data, colors.HexColor("#1E293B"), "Historico.pdf", total_suma=total_suma, titulo_total="TOTAL GENERAL DE INGRESOS", mensaje_vacio=mensaje_vacio)
     except Exception as e: return jsonify({"error": str(e)}), 500
 
 @reportes_bp.route("/reportes/deudores", methods=["GET", "OPTIONS"])
@@ -441,14 +447,14 @@ def reporte_deudores():
         
         data = list(alu_dict.values())
         
-        # ✅ ELIMINAMOS EL RETORNO DE ERROR 404 PARA QUE DESCARGUE EL PDF VACÍO
-        mensaje_vacio = "No se encontraron alumnos con adeudos pendientes para los filtros seleccionados." # 🔥 Mensaje personalizado
+        mensaje_vacio = "No se encontraron alumnos con adeudos pendientes para los filtros seleccionados." 
         titulo = f"ALUMNOS CON DEUDAS" + (f" - {sem}° SEM" if sem else "")
 
         if formato == 'excel':
             excel_data = [{"Matrícula": x["Matrícula"], "Alumno": x["Alumno"], "Adeudo": x["Total"]} for x in data] if data else []
             return generar_excel(excel_data, "Deudores", "Deudores.xlsx", mensaje_vacio)
         
+        # Dejamos que use el valor por defecto es_individual=False
         return generar_pdf_deudores_pro(data, titulo, "Deudores.pdf", mensaje_vacio)
     except Exception as e: return jsonify({"error": str(e)}), 500
 
@@ -489,8 +495,7 @@ def reporte_al_corriente():
             if not tiene_deuda:
                 data.append({"Matrícula": a.matricula, "Alumno": f"{a.apellido} {a.nombre}".upper(), "Estatus": "AL CORRIENTE"})
         
-        # ✅ NO HAY 404. SE GENERA DOCUMENTO.
-        mensaje_vacio = "Actualmente no hay alumnos al corriente en sus pagos bajo los filtros seleccionados." # 🔥 Mensaje personalizado
+        mensaje_vacio = "Actualmente no hay alumnos al corriente en sus pagos bajo los filtros seleccionados." 
         titulo = f"ALUMNOS AL CORRIENTE" + (f" - {sem}° SEM" if sem else "")
         
         if formato == 'excel': 
@@ -512,11 +517,14 @@ def respaldo_db():
         return jsonify({"error": "Solo el nivel SISTEMAS puede generar respaldos físicos de la base de datos"}), 403
 
     DB_HOST = 'localhost'
-    DB_USER = 'root'    
-    DB_PASS = ''        
-    DB_NAME = 'sistema_prepajmu' 
+    DB_USER = 'jmu_user'    
+    DB_PASS = 'Jmu12345*'        
+    DB_NAME = 'jmu_bd_nueva' 
 
-    ruta_mysqldump = r"C:\xampp\mysql\bin\mysqldump.exe" 
+    if platform.system() == 'Windows':
+        ruta_mysqldump = r"C:\xampp\mysql\bin\mysqldump.exe"
+    else:
+        ruta_mysqldump = "mysqldump" 
     
     if DB_PASS == '':
         comando = f"{ruta_mysqldump} -h {DB_HOST} -u {DB_USER} {DB_NAME}"
@@ -543,4 +551,77 @@ def respaldo_db():
         return send_file(buffer, as_attachment=True, download_name=nombre_archivo, mimetype='application/sql')
 
     except Exception as e: 
+        return jsonify({"error": str(e)}), 500
+    
+@reportes_bp.route("/reportes/adeudo/<matricula>", methods=["GET", "OPTIONS"])
+def reporte_adeudo_individual(matricula):
+    if request.method == "OPTIONS": return jsonify({}), 200
+
+    # Permitir token por cabecera (Angular HTTP) o por URL (window.open)
+    try: verify_jwt_in_request(locations=["headers", "query_string"])
+    except Exception: return jsonify({"error": "Sesión inválida o token ausente"}), 401
+
+    operador = get_jwt()
+    if operador.get('rol') not in ['SISTEMAS', 'ADMIN', 'LECTURA']:
+        return jsonify({"error": "Acceso denegado"}), 403
+
+    try:
+        # 1. Buscar al alumno exacto
+        alumno = Alumno.query.filter_by(matricula=matricula).first()
+        if not alumno:
+            return jsonify({"error": "Alumno no encontrado"}), 404
+
+        hoy = hoy_mx()
+        f_limite = alumno.fecha_baja if (alumno.estatus == 'BAJA' and alumno.fecha_baja) else hoy
+
+        # 2. Buscar sus pagos pendientes o parciales
+        pagos = db.session.query(Pago, EstructuraPago)\
+            .join(EstructuraPago)\
+            .filter(Pago.id_alumno == alumno.id_alumno, Pago.estado.in_(['PENDIENTE', 'PARCIAL']))\
+            .all()
+
+        conceptos_adeudados = []
+        total_deuda = 0.0
+
+        for p, e in pagos:
+            # Misma lógica estricta de vencimiento que ya usas
+            if (e.semestre or 1) <= (alumno.semestre_actual or 1):
+                vencido = False
+                if e.anio and e.mes:
+                    if e.anio < f_limite.year or (e.anio == f_limite.year and e.mes <= f_limite.month): 
+                        vencido = True
+                else: 
+                    vencido = (alumno.estatus != 'BAJA')
+                
+                if vencido:
+                    deuda = float(e.monto) - float(p.monto_abonado or 0)
+                    if deuda > 0:
+                        conceptos_adeudados.append({"concepto": e.concepto, "monto": deuda})
+                        total_deuda += deuda
+
+        # 3. Formatear para tu motor "generar_pdf_deudores_pro"
+        data_agrupada = []
+        if total_deuda > 0:
+            nombre_str = f"{alumno.apellido} {alumno.nombre}".upper()
+            if alumno.estatus == 'BAJA': nombre_str += " [BAJA]"
+            
+            data_agrupada.append({
+                "Matrícula": alumno.matricula,
+                "Alumno": nombre_str,
+                "Conceptos": conceptos_adeudados,
+                "Total": total_deuda
+            })
+
+        try: registrar_accion(operador.get('id'), "DESCARGA_AVISO_ADEUDO", f"Descargó aviso de adeudo individual del alumno {matricula}")
+        except: pass
+
+        titulo = "AVISO DE PAGO VENCIDO"
+        nombre_archivo = f"Aviso_Adeudo_{matricula}.pdf"
+        mensaje_vacio = f"El alumno con matrícula {matricula} no tiene adeudos vencidos."
+
+        # 🔥 MODIFICADO: Se añade es_individual=True para que las tablas grandes fluyan bien
+        return generar_pdf_deudores_pro(data_agrupada, titulo, nombre_archivo, mensaje_vacio, descargar=False, es_individual=True)
+
+    except Exception as e: 
+        print("ERROR AVISO ADEUDO:", str(e))
         return jsonify({"error": str(e)}), 500

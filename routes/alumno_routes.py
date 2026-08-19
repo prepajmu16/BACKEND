@@ -50,7 +50,10 @@ def listar_alumnos():
         return jsonify(resultado), 200
     except Exception as e:
         return jsonify({"error": str(e)}), 500
-    
+
+# ==========================================
+# 🎓 GESTIÓN DE ALUMNOS (Registro)
+# ==========================================
 @alumno_bp.route('/alumnos', methods=['POST', 'OPTIONS'])
 def registrar_alumno_con_usuario():
     if request.method == 'OPTIONS': return jsonify({}), 200
@@ -61,10 +64,9 @@ def registrar_alumno_con_usuario():
     
     operador = get_jwt()
     if operador.get('rol') not in ['SISTEMAS', 'ADMIN']:
-        return jsonify({"error": "No tienes permisos para inscribir alumnos"}), 403
-        
+        return jsonify({"error": "Solo personal administrativo puede registrar alumnos"}), 403
+
     data = request.get_json()
-    
     try:
         matricula_req = data.get('matricula')
         nombre_req = data.get('nombre')
@@ -73,95 +75,49 @@ def registrar_alumno_con_usuario():
         id_generacion_req = data.get('id_generacion')
         id_grupo_req = data.get('id_grupo')
 
-        if not fecha_nac_req:
-            return jsonify({'error': 'La fecha de nacimiento es obligatoria'}), 400
+        if not fecha_nac_req: return jsonify({'error': 'La fecha de nacimiento es obligatoria para generar el acceso'}), 400
+        if Alumno.query.filter_by(matricula=matricula_req).first() or Usuario.query.filter_by(correo=matricula_req).first():
+            return jsonify({'error': 'Esta matrícula ya está registrada en el sistema'}), 400
 
-        alumno_existente = Alumno.query.filter_by(matricula=matricula_req).first()
-        usuario_existente = Usuario.query.filter_by(correo=matricula_req).first()
-        
         password_creada = generar_password_alumno(nombre_req, apellido_req, fecha_nac_req)
 
-        if alumno_existente:
-            if alumno_existente.estatus == 'ACTIVO':
-                return jsonify({'error': 'Esta matrícula ya pertenece a un alumno ACTIVO.'}), 400
-            
-            alumno_existente.nombre = nombre_req
-            alumno_existente.apellido = apellido_req
-            alumno_existente.fecha_nacimiento = fecha_nac_req
-            alumno_existente.id_generacion = id_generacion_req
-            alumno_existente.id_grupo = id_grupo_req
-            alumno_existente.estatus = 'ACTIVO'
-            alumno_existente.semestre_actual = 1 
-            alumno_existente.fecha_baja = None 
-            
-            if usuario_existente:
-                usuario_existente.nombre = f"{nombre_req} {apellido_req}"
-                usuario_existente.contraseña = generate_password_hash(password_creada)
-                usuario_existente.estado = "ACTIVO"
+        nuevo_usuario = Usuario(
+            nombre=f"{nombre_req} {apellido_req}", correo=matricula_req,
+            contraseña=generate_password_hash(password_creada), rol="ALUMNO", estado="ACTIVO"
+        )
+        db.session.add(nuevo_usuario)
+        db.session.flush() 
 
-            Pago.query.filter_by(id_alumno=alumno_existente.id_alumno, estado='PENDIENTE').update({
-                'estado': 'CANCELADO' 
-            })
-            
-            target_alumno = alumno_existente
-            mensaje_log = f"RE-INSCRIPCIÓN: Alumno {matricula_req} reingresado a Gen {id_generacion_req}"
+        nuevo_alumno = Alumno(
+            matricula=matricula_req, nombre=nombre_req, apellido=apellido_req,
+            fecha_nacimiento=fecha_nac_req, id_generacion=id_generacion_req,
+            id_grupo=id_grupo_req, id_usuario=nuevo_usuario.id_usuario, 
+            estatus="ACTIVO", semestre_actual=1 
+        )
+        db.session.add(nuevo_alumno)
+        db.session.flush() 
 
-        else:
-            nuevo_usuario = Usuario(
-                nombre=f"{nombre_req} {apellido_req}",
-                correo=matricula_req,
-                contraseña=generate_password_hash(password_creada),
-                rol="ALUMNO",
-                estado="ACTIVO"
-            )
-            db.session.add(nuevo_usuario)
-            db.session.flush() 
-
-            nuevo_alumno = Alumno(
-                matricula=matricula_req,
-                nombre=nombre_req,
-                apellido=apellido_req,
-                fecha_nacimiento=fecha_nac_req,
-                id_generacion=id_generacion_req,
-                id_grupo=id_grupo_req,
-                id_usuario=nuevo_usuario.id_usuario,
-                estatus="ACTIVO",
-                semestre_actual=1 
-            )
-            db.session.add(nuevo_alumno)
-            db.session.flush()
-            
-            target_alumno = nuevo_alumno
-            mensaje_log = f"NUEVO ALUMNO: {matricula_req} ({nombre_req} {apellido_req}) inscrito"
-
-        estructuras_nuevas = EstructuraPago.query.filter_by(id_generacion=id_generacion_req).all()
-        for molde in estructuras_nuevas:
+        # 🔥 LA SOLUCIÓN INFALIBLE: Filtro Positivo replicado en Admin
+        estructuras_generacion = EstructuraPago.query.filter(
+            EstructuraPago.id_generacion == id_generacion_req,
+            EstructuraPago.tipo.in_(['INSCRIPCION', 'MENSUALIDAD'])
+        ).all()
+        
+        for molde in estructuras_generacion:
             nuevo_pago = Pago(
-                id_alumno=target_alumno.id_alumno,
-                id_estructura=molde.id_estructura,
-                estado='PENDIENTE',
-                numero_oportunidad=1
+                id_alumno=nuevo_alumno.id_alumno, id_estructura=molde.id_estructura,
+                estado='PENDIENTE', numero_oportunidad=1
             )
             db.session.add(nuevo_pago)
-        
+            
         db.session.commit()
 
-        registrar_accion(
-            id_usuario=obtener_id_admin(),
-            accion="INSCRIPCION_ALUMNO",
-            descripcion=mensaje_log
-        )
-
-        return jsonify({
-            'message': 'Proceso completado con éxito', 
-            'password_generada': password_creada
-        }), 201
-
+        registrar_accion(id_usuario=obtener_id_admin(), accion="NUEVO_ALUMNO", descripcion=f"Inscribió al alumno {matricula_req}")
+        return jsonify({'message': 'Alumno inscrito y cuenta creada', 'password_generada': password_creada}), 201
     except Exception as e:
         db.session.rollback()
-        print("🔴 Error:", str(e))
-        return jsonify({'error': 'Error al procesar la inscripción'}), 500
-
+        return jsonify({'error': 'Ocurrió un error al registrar el alumno'}), 500
+    
 # ==========================================
 # ✏️ ACTUALIZAR ALUMNO
 # ==========================================
@@ -447,12 +403,13 @@ def liberar_matricula(matricula):
 # ==========================================
 # 🎓 API: ESTADO DE CUENTA DEL ALUMNO (PORTAL)
 # ==========================================
-# 🔥 CAMBIO AQUÍ: Agregamos /portal/ para que no choque con <matricula>
+# ==========================================
+# 🎓 API: ESTADO DE CUENTA DEL ALUMNO (PORTAL)
+# ==========================================
 @alumno_bp.route('/alumnos/portal/mi-estado-cuenta', methods=['GET', 'OPTIONS'])
 def obtener_mi_estado_cuenta():
     if request.method == "OPTIONS": return jsonify({}), 200
 
-    # 🛡️ VALIDACIÓN DE TOKEN Y ROL
     try: 
         verify_jwt_in_request()
     except Exception: 
@@ -460,48 +417,29 @@ def obtener_mi_estado_cuenta():
     
     operador = get_jwt()
     if operador.get('rol') != 'ALUMNO':
-        return jsonify({"error": "Solo los alumnos pueden ver su estado de cuenta personal"}), 403
+        return jsonify({"error": "Solo alumnos"}), 403
 
     try:
-        # 1. Obtener la identidad del token
         usuario_actual = operador.get('sub') 
-        print(f"🔥 DEBUG TOKEN: La identidad del token es -> {usuario_actual}")
-
-        # 2. BÚSQUEDA INTELIGENTE DE USUARIO
-        # Intento A: ¿El token guardó el correo / matrícula?
-        usuario = Usuario.query.filter_by(correo=str(usuario_actual)).first()
         
-        # Intento B: Si falló, ¿quizás el token guardó el ID numérico del usuario?
+        # Búsqueda segura del usuario
+        usuario = Usuario.query.filter_by(correo=str(usuario_actual)).first()
         if not usuario:
             usuario = Usuario.query.filter_by(id_usuario=usuario_actual).first()
 
-        if not usuario:
-            print("❌ ERROR: No existe ningún usuario con ese dato en la BD.")
-            return jsonify({"message": "Usuario no encontrado"}), 404
+        if not usuario: return jsonify({"message": "Usuario no encontrado"}), 404
 
-        print(f"✅ ÉXITO: Usuario encontrado -> {usuario.nombre}")
-
-        # 3. BÚSQUEDA INTELIGENTE DEL ALUMNO
-        # Intento A: Buscar por el enlace directo de llaves foráneas
+        # Búsqueda segura del alumno
         alumno = Alumno.query.filter_by(id_usuario=usuario.id_usuario).first()
-        
-        # Intento B: Si por algún error de base de datos no está enlazado el ID, buscamos por matrícula
         if not alumno:
             alumno = Alumno.query.filter_by(matricula=usuario.correo).first()
 
-        if not alumno:
-            print("❌ ERROR: El usuario existe, pero no está registrado como Alumno.")
-            return jsonify({"message": "Alumno no encontrado para este usuario"}), 404
+        if not alumno: return jsonify({"message": "Alumno no encontrado"}), 404
 
-        print(f"✅ ÉXITO: Alumno enlazado -> {alumno.matricula}")
-
-        # 4. Buscar todos los pagos de este alumno
         pagos = Pago.query.filter_by(id_alumno=alumno.id_alumno).all()
 
-        # 5. Formatear los datos principales
         nombre_grupo = "S/G"
         if alumno.grupo:
-            # Revisa si tu modelo Grupo usa .nombre o .nombre_grupo
             nombre_grupo = getattr(alumno.grupo, 'nombre_grupo', getattr(alumno.grupo, 'nombre', 'S/G'))
 
         datos_alumno = {
@@ -511,24 +449,35 @@ def obtener_mi_estado_cuenta():
             "semestre_actual": alumno.semestre_actual
         }
 
-       # 6. Formatear los pagos
         historial_pagos = []
         for p in pagos:
             estructura = EstructuraPago.query.get(p.id_estructura)
             
+            # 1. Buscamos la oportunidad (ya sea que esté en la tabla Pago o en Estructura)
+            op_txt = getattr(p, 'oportunidad', getattr(estructura, 'oportunidad', None))
+            
+            # 2. Cálculo seguro del restante
+            restante_val = getattr(p, 'restante', getattr(p, 'monto_restante', None))
+            if restante_val is None:
+                # Si no existe la columna, lo calculamos matemáticamente
+                m_tot = float(getattr(estructura, 'monto', 0) or 0)
+                m_ab = float(getattr(p, 'monto_abonado', 0) or 0)
+                restante_val = m_tot - m_ab
+
             historial_pagos.append({
-                "id": p.id_pago if hasattr(p, 'id_pago') else getattr(p, 'id', None),
+                "id": getattr(p, 'id_pago', getattr(p, 'id', None)),
                 "concepto": estructura.concepto if estructura else "Pago",
                 "categoria": estructura.tipo if estructura else "Otro",
+                "monto": float(getattr(estructura, 'monto', 0) or 0), 
+                "restante": float(restante_val),
                 
-                # 🔥 CORRECCIÓN DEL $0.00 AQUÍ: Tomamos el costo total desde la "Estructura"
-                "monto": estructura.monto if estructura else 0, 
+                # Leemos el estado real, sin adivinanzas
+                "pagado": getattr(p, 'pagado', getattr(p, 'estado', '') == 'PAGADO'),
+                "es_parcial": getattr(p, 'es_parcial', getattr(p, 'estado', '') in ['ABONADO', 'PARCIAL']),
                 
-                "restante": p.restante if hasattr(p, 'restante') else getattr(p, 'monto_restante', 0),
-                "pagado": True if p.estado == 'PAGADO' else False,
-                "es_parcial": True if p.estado == 'ABONADO' else False,
+                "oportunidad": op_txt if (estructura and estructura.tipo == 'EEE') else None,
                 "folio": getattr(p, 'folio_recibo', getattr(p, 'folio', None)),
-                "fecha_pago": p.fecha_pago.strftime('%Y-%m-%d') if p.fecha_pago else None,
+                "fecha_pago": p.fecha_pago.strftime('%Y-%m-%d') if hasattr(p, 'fecha_pago') and p.fecha_pago else None,
                 "semestre": estructura.semestre if estructura else 1
             })
             
@@ -540,7 +489,6 @@ def obtener_mi_estado_cuenta():
     except Exception as e:
         print(f"🔴 Error interno en mi-estado-cuenta: {str(e)}")
         return jsonify({"message": "Error interno del servidor", "detalle": str(e)}), 500
-
 """ 2 from flask import Blueprint, request, jsonify
 from werkzeug.security import generate_password_hash
 from extensions import db

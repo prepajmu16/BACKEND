@@ -5,6 +5,7 @@ from .alumno import Alumno
 from .estructura_pago import EstructuraPago
 from .pago import Pago
 from .bitacora import Bitacora
+from .abonos_pago import AbonoPago
 
 # Esto permite que hagas: from models import Usuario, Alumno...
 __all__ = [
@@ -14,5 +15,6 @@ __all__ = [
     "Alumno", 
     "EstructuraPago", 
     "Pago", 
-    "Bitacora"
+    "Bitacora",
+    "AbonoPago"
 ]
