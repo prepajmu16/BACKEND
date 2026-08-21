@@ -1,14 +1,14 @@
 from flask import Blueprint, request, jsonify, send_file
 import io
 import os
+import re
 import pandas as pd
 import traceback
-import platform
 from datetime import datetime, date
 from sqlalchemy import func 
 from extensions import db
 
-# 📚 MODELOS
+# MODELOS
 from models.pago import Pago
 from models.alumno import Alumno
 from models.estructura_pago import EstructuraPago
@@ -18,16 +18,16 @@ from models.abonos_pago import AbonoPago
 from helpers import registrar_accion, obtener_id_admin
 import subprocess
 
-# 🔥 IMPORTAMOS ZONEINFO PARA FORZAR HORA DE MÉXICO EN TODO EL ARCHIVO
+# IMPORTAMOS ZONEINFO PARA FORZAR HORA DE MEXICO EN TODO EL ARCHIVO
 from zoneinfo import ZoneInfo 
 
-# 🛡️ IMPORTAMOS EL ESCUDO DE SEGURIDAD
+# IMPORTAMOS EL ESCUDO DE SEGURIDAD
 from flask_jwt_extended import verify_jwt_in_request, get_jwt
 
-# --- EXCEL PRO ---
+# EXCEL PRO
 from openpyxl.styles import Font, PatternFill, Alignment
 
-# --- PDF PRO ---
+# PDF PRO
 from reportlab.lib.pagesizes import letter
 from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer, KeepTogether, Image
 from reportlab.lib.styles import getSampleStyleSheet
@@ -36,26 +36,135 @@ from reportlab.lib.enums import TA_LEFT
 
 reportes_bp = Blueprint('reportes_bp', __name__)
 
-# 🔥 RUTA DEL LOGO
+# RUTA DEL LOGO
 BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 RUTA_LOGO = os.path.join(BASE_DIR, 'static', 'img', 'LOGO3.png')
 
-print(f"\n--- 🔍 REVISANDO LOGO EN: {RUTA_LOGO} ---")
+print(f"\n--- REVISANDO LOGO EN: {RUTA_LOGO} ---")
 if os.path.exists(RUTA_LOGO):
-    print("✅ LOGO ENCONTRADO\n")
+    print(" LOGO ENCONTRADO\n")
 else:
-    print("❌ LOGO NO ENCONTRADO - Revisa la carpeta static/img\n")
+    print(" LOGO NO ENCONTRADO - Revisa la carpeta static/img\n")
 
 def limpiar_param(val):
     if val in [None, "null", "undefined", "", "Todos", "0"]: return None
     return val
 
-# 🕒 FUNCIONES MAESTRAS PARA OBTENER LA HORA DE MÉXICO
+# FUNCIONES MAESTRAS PARA OBTENER LA HORA DE MEXICO
 def ahora_mx():
     return datetime.now(ZoneInfo("America/Mexico_City"))
 
 def hoy_mx():
     return ahora_mx().date()
+
+# 🔥 LA FUNCIÓN DEFINITIVA: ORDEN CURRICULAR EXACTO + BLOQUES + DICCIONARIO 🔥
+def ordenar_conceptos_escolares(lista_adeudos):
+    meses_orden = {
+        'AGOSTO': 1, 'SEPTIEMBRE': 2, 'OCTUBRE': 3, 'NOVIEMBRE': 4,
+        'DICIEMBRE': 5, 'ENERO': 6, 'FEBRERO': 7, 'MARZO': 8,
+        'ABRIL': 9, 'MAYO': 10, 'JUNIO': 11, 'JULIO': 12
+    }
+
+    # 🧠 LISTAS MAESTRAS DE ORDEN CURRICULAR POR SEMESTRE (En orden de tus fotos)
+    MATERIAS_POR_SEMESTRE = {
+        1: ['LA MATERIA Y SUS INTERACCIONES', 'CIENCIAS SOCIALES I', 'CULTURA DIGITAL I', 'PENSAMIENTO MATEMATICO I', 'PENSAMIENTO MATEMÁTICO I', 'LENGUA Y COMUNICACION I', 'LENGUA Y COMUNICACIÓN I', 'INGLES I', 'INGLÉS I', 'HUMANIDADES I', 'LABORATORIO DE INV', 'LABORATORIO DE INVESTIGACION', 'CIENCIAS NATURALES, EXPERIMENTALES Y TECNOLOGIA I', 'PENSAMIENTO FILOSOFICO Y HUMANIDADES I', 'EDUCACION SOCIOEMOCIONAL I', 'ARTISTICA', 'ARTÍSTICA', 'EDU FISICA', 'EDUCACION FISICA', 'HABILIDAD'],
+        2: ['CONSERVACION DE LA ENERGIA', 'CONSERVACIÓN DE LA ENERGÍA', 'CIENCIAS SOCIALES II', 'CULTURA DIGITAL II', 'PENSAMIENTO MATEMATICO II', 'PENSAMIENTO MATEMÁTICO II', 'LENGUA Y COMUNICACION II', 'LENGUA Y COMUNICACIÓN II', 'INGLES II', 'INGLÉS II', 'HUMANIDADES II', 'TALLER DE CIENCIAS I', 'CIENCIAS NATURALES, EXPERIMENTALES Y TECNOLOGIA II', 'PENSAMIENTO FILOSOFICO Y HUMANIDADES II', 'EDUCACION SOCIOEMOCIONAL II', 'SOCIOLOGIA', 'SOCIOLOGÍA', 'PSICOLOGIA', 'PSICOLOGÍA'],
+        3: ['ECOSISTEMAS', 'PENSAMIENTO MATEMATICO III', 'PENSAMIENTO MATEMÁTICO III', 'LENGUA Y COMUNICACION III', 'LENGUA Y COMUNICACIÓN III', 'INGLES III', 'INGLÉS III', 'HUMANIDADES III', 'TALLER DE CIENCIAS II', 'CONCEPTOS DE DESARROLLO', 'CONCEPTOS DE LA COMUNIDAD', 'CIENCIAS NATURALES, EXPERIMENTALES Y TECNOLOGIA III', 'PENSAMIENTO FILOSOFICO Y HUMANIDADES III', 'EDUCACION SOCIOEMOCIONAL III', 'INFORMATICA III', 'INFORMÁTICA III', 'HISTORIA DEL ARTE', 'PEDAGOGIA', 'PEDAGOGÍA'],
+        4: ['REACCIONES QUIM', 'REACCIONES QUÍM', 'REACIONES QUIM', 'REACCIONES QUIMICAS', 'CONCIENCIA HISTORICA I', 'CONCIENCIA HISTÓRICA I', 'TALLER DE CULTURA DIGITAL', 'TEMAS SELECTOS DE MATEMATICAS I', 'TEMAS SELECTOS DE MATEMÁTICAS I', 'PENSAMIENTO LITERARIO', 'INGLES IV', 'INGLÉS IV', 'ESPACIO Y SOCIEDAD', 'CIENCIAS SOCIALES III', 'DIAGNOSTICO COMUNITARIO', 'DIAGNÓSTICO COMUNITARIO', 'CIENCIAS NATURALES, EXPERIMENTALES Y TECNOLOGIA IV', 'PENSAMIENTO MATEMATICO IV', 'PENSAMIENTO MATEMÁTICO IV', 'EDUCACION SOCIOEMOCIONAL IV', 'DERECHO I', 'ETIMOLOGIAS', 'ETIMOLOGÍAS'],
+        5: ['ENERGIA EN LOS PROCESOS', 'ENERGÍA EN LOS PROCESOS', 'CONCIENCIA HISTORICA II', 'CONCIENCIA HISTÓRICA II', 'CALCULO DIFERENCIAL', 'CÁLCULO DIFERENCIAL', 'TEMAS SELECTOS DE BIOLOGIA I', 'TEMAS SELECTOS DE BIOLOGÍA I', 'TEMAS SELECTOS DE QUIMICA I', 'TEMAS SELECTOS DE QUÍMICA I', 'CONTABILIDAD I', 'FORMAS LEGALES', 'FORMULACION DE PROYECTOS', 'FORMULACIÓN DE PROYECTOS', 'CIENCIAS NATURALES, EXPERIMENTALES Y TECNOLOGIA V', 'PENSAMIENTO MATEMATICO V', 'PENSAMIENTO MATEMÁTICO V', 'INGLES V', 'INGLÉS V', 'EDUCACION SOCIOEMOCIONAL V', 'INFORMATICA V', 'INFORMÁTICA V', 'MAT FINANCIERAS', 'MAT. FINANCIERAS', 'FILOSOFIA', 'FILOSOFÍA'],
+        6: ['ORGANISMOS', 'CONCIENCIA HISTORICA III', 'CONCIENCIA HISTÓRICA III', 'TEMAS SELECTOS DE MATEMATICAS II', 'TEMAS SELECTOS DE MATEMÁTICAS II', 'CALCULO INTEGRAL', 'CÁLCULO INTEGRAL', 'TEMAS SELECTOS DE BIOLOGIA II', 'TEMAS SELECTOS DE BIOLOGÍA II', 'TEMAS SELECTOS DE QUIMICA II', 'TEMAS SELECTOS DE QUÍMICA II', 'CONTABILIDAD II', 'SOCIEDADES MERCANTILES', 'INSTRUMENTOS DE PROYECTOS', 'CIENCIAS NATURALES, EXPERIMENTALES Y TECNOLOGIA VI', 'CULTURA DIGITAL III', 'PENSAMIENTO MATEMATICO VI', 'PENSAMIENTO MATEMÁTICO VI', 'EDUCACION SOCIOEMOCIONAL VI', 'INGLES VI', 'INGLÉS VI', 'INFORMATICA VI', 'INFORMÁTICA VI', 'ADMINISTRACION', 'ADMINISTRACIÓN']
+    }
+
+    # 🔥 NUEVA MAGIA: Averiguar la posición exacta de la materia en tu currícula
+    def obtener_indice_materia(semestre, concepto):
+        if semestre in MATERIAS_POR_SEMESTRE:
+            for idx, materia in enumerate(MATERIAS_POR_SEMESTRE[semestre]):
+                if re.search(rf'\b{re.escape(materia)}\b', concepto):
+                    return idx
+        return 999 # Si es una materia rara que no está en lista, la manda al fondo
+
+    def rescatar_semestre(concepto):
+        # Busca la materia en todas las listas para adivinar el semestre
+        for sem, materias in MATERIAS_POR_SEMESTRE.items():
+            for materia in materias:
+                if re.search(rf'\b{re.escape(materia)}\b', concepto):
+                    return sem
+        
+        # Si no la encuentra, intenta adivinar por el número romano (I, II, III...)
+        match_roman = re.search(r'\b(I|II|III|IV|V|VI)\b$', concepto.replace('.', '').strip())
+        if match_roman:
+            return {'I': 1, 'II': 2, 'III': 3, 'IV': 4, 'V': 5, 'VI': 6}[match_roman.group(1)]
+        
+        return None
+
+    # ========================================================
+    # 1. ASIGNAR SEMESTRE Y ETIQUETA
+    # ========================================================
+    for item in lista_adeudos:
+        concepto_original = str(item.get('concepto', ''))
+        concepto_upper = concepto_original.upper().strip()
+        
+        es_mes = any(mes in concepto_upper for mes in meses_orden)
+        es_inscripcion = 'INSCRIPCIÓN' in concepto_upper or 'INSCRIPCION' in concepto_upper
+        es_legalizacion = 'LEGALIZACION' in concepto_upper or 'LEGALIZACIÓN' in concepto_upper or 'CERTIFICADO' in concepto_upper
+        
+        semestre_bd = item.get('semestre')
+        
+        semestre_final = semestre_bd
+        if not semestre_final:
+            match_sem = re.search(r'(\d+)°\s*SEM', concepto_upper)
+            if match_sem:
+                semestre_final = int(match_sem.group(1))
+            else:
+                semestre_final = rescatar_semestre(concepto_upper)
+        
+        item['semestre_calculado'] = semestre_final or 99 
+
+        if not es_mes and not es_inscripcion and not es_legalizacion:
+            if "SEM" not in concepto_upper and semestre_final:
+                item['concepto'] = f"{concepto_original} - {semestre_final}° SEM"
+
+    # ========================================================
+    # 2. ORDENAR ESTRICTAMENTE
+    # ========================================================
+    def criterio_orden(item):
+        concepto = str(item.get('concepto', '')).upper().strip()
+        semestre_real = item.get('semestre_calculado', 99)
+        
+        # BLOQUE 3: LEGALIZACIÓN
+        if 'LEGALIZACION' in concepto or 'LEGALIZACIÓN' in concepto or 'CERTIFICADO' in concepto:
+            return (3, 999, 999, 999, 999, concepto) 
+        
+        es_inscripcion = 'INSCRIPCIÓN' in concepto or 'INSCRIPCION' in concepto
+        es_mes_val = next((mes for mes in meses_orden if mes in concepto), None)
+
+        # BLOQUE 1: INSCRIPCIONES Y MESES
+        if es_inscripcion:
+            return (1, semestre_real, 1, 0, 0, concepto)
+        elif es_mes_val:
+            return (1, semestre_real, 2, meses_orden[es_mes_val], 0, concepto)
+        
+        # BLOQUE 2: EXTRAS ORDENADOS POR CURRÍCULA
+        else:
+            if 'REG.OPORTUNIDAD' in concepto or 'REG OPORTUNIDAD' in concepto or 'REG. OPORTUNIDAD' in concepto:
+                sub_prioridad = 1
+            elif 'PRIMERA OPORTUNIDAD' in concepto or '1RA OPORTUNIDAD' in concepto or '1RA. OPORTUNIDAD' in concepto:
+                sub_prioridad = 2
+            elif 'SEGUNDA OPORTUNIDAD' in concepto or '2DA OPORTUNIDAD' in concepto or '2DA. OPORTUNIDAD' in concepto:
+                sub_prioridad = 3
+            elif 'TERCERA OPORTUNIDAD' in concepto or '3RA OPORTUNIDAD' in concepto or '3RA. OPORTUNIDAD' in concepto:
+                sub_prioridad = 4
+            elif 'OPORTUNIDAD' in concepto:
+                sub_prioridad = 5
+            else:
+                sub_prioridad = 6 # Materia regular
+            
+            # Buscamos en qué posición está en la currícula oficial (1ra, 2da, 3ra...)
+            orden_materia = obtener_indice_materia(semestre_real, concepto)
+
+            return (2, semestre_real, 3, sub_prioridad, orden_materia, concepto)
+
+    return sorted(lista_adeudos, key=criterio_orden)
 
 # --- 1. PIE DE PÁGINA ---
 def pie_de_pagina(canvas, doc):
@@ -153,8 +262,8 @@ def generar_pdf_deudores_pro(data_agrupada, titulo_str, nombre_archivo, mensaje_
             tabla_data.append(["TOTAL ADEUDO", "${:,.2f}".format(alu['Total'])])
             total_general += alu["Total"]
             
-            # 🔥 Agregado repeatRows=1 por si la tabla se divide en dos hojas
-            t = Table(tabla_data, colWidths=[460, 70], hAlign='LEFT', repeatRows=1)
+            # Ajuste de ancho de columnas para que el titulo "Monto Restante" quepa perfectamente
+            t = Table(tabla_data, colWidths=[430, 100], hAlign='LEFT', repeatRows=1)
             t.setStyle(TableStyle([
                 ('BACKGROUND', (0,0), (-1,0), colors.HexColor("#b91c1c")), 
                 ('TEXTCOLOR', (0,0), (-1,0), colors.whitesmoke),
@@ -165,7 +274,6 @@ def generar_pdf_deudores_pro(data_agrupada, titulo_str, nombre_archivo, mensaje_
                 ('TEXTCOLOR', (0,-1), (-1,-1), colors.HexColor("#b91c1c")),
             ]))
             
-            # 🔥 Aquí controlamos si usamos KeepTogether o lo dejamos fluir
             if es_individual:
                 elementos.append(p_nombre)
                 elementos.append(espacio)
@@ -187,7 +295,6 @@ def generar_pdf_deudores_pro(data_agrupada, titulo_str, nombre_archivo, mensaje_
     doc.build(elementos, onFirstPage=pie_de_pagina, onLaterPages=pie_de_pagina)
     buffer.seek(0)
     
-    # 🔥 AQUÍ APLICAMOS LA VARIABLE: as_attachment=descargar
     return send_file(buffer, mimetype='application/pdf', as_attachment=descargar, download_name=nombre_archivo)
 
 # --- 4. MOTOR PDF GENÉRICO CON TOTALIZADOR ---
@@ -442,9 +549,14 @@ def reporte_deudores():
                             if a.id_alumno not in alu_dict:
                                 nom = f"{a.apellido} {a.nombre}".upper() + (" [BAJA]" if a.estatus == 'BAJA' else "")
                                 alu_dict[a.id_alumno] = {"Matrícula": a.matricula, "Alumno": nom, "Conceptos": [], "Total": 0}
-                            alu_dict[a.id_alumno]["Conceptos"].append({"concepto": e.concepto, "monto": deuda})
+                            # ASEGURAR PASAR e.semestre AQUI
+                            alu_dict[a.id_alumno]["Conceptos"].append({"concepto": e.concepto, "monto": deuda, "semestre": e.semestre})
                             alu_dict[a.id_alumno]["Total"] += deuda
-        
+                            
+        # APLICAR EL ORDENAMIENTO INTELIGENTE A CADA ALUMNO
+        for key in alu_dict:
+            alu_dict[key]["Conceptos"] = ordenar_conceptos_escolares(alu_dict[key]["Conceptos"])
+
         data = list(alu_dict.values())
         
         mensaje_vacio = "No se encontraron alumnos con adeudos pendientes para los filtros seleccionados." 
@@ -454,7 +566,6 @@ def reporte_deudores():
             excel_data = [{"Matrícula": x["Matrícula"], "Alumno": x["Alumno"], "Adeudo": x["Total"]} for x in data] if data else []
             return generar_excel(excel_data, "Deudores", "Deudores.xlsx", mensaje_vacio)
         
-        # Dejamos que use el valor por defecto es_individual=False
         return generar_pdf_deudores_pro(data, titulo, "Deudores.pdf", mensaje_vacio)
     except Exception as e: return jsonify({"error": str(e)}), 500
 
@@ -517,14 +628,11 @@ def respaldo_db():
         return jsonify({"error": "Solo el nivel SISTEMAS puede generar respaldos físicos de la base de datos"}), 403
 
     DB_HOST = 'localhost'
-    DB_USER = 'jmu_user'    
-    DB_PASS = 'Jmu12345*'        
-    DB_NAME = 'jmu_bd_nueva' 
+    DB_USER = 'root'    
+    DB_PASS = ''        
+    DB_NAME = 'sistema_prepajmu' 
 
-    if platform.system() == 'Windows':
-        ruta_mysqldump = r"C:\xampp\mysql\bin\mysqldump.exe"
-    else:
-        ruta_mysqldump = "mysqldump" 
+    ruta_mysqldump = r"C:\xampp\mysql\bin\mysqldump.exe" 
     
     if DB_PASS == '':
         comando = f"{ruta_mysqldump} -h {DB_HOST} -u {DB_USER} {DB_NAME}"
@@ -536,7 +644,7 @@ def respaldo_db():
         salida, error = proceso.communicate()
 
         if proceso.returncode != 0:
-            print(f"❌ ERROR DE MYSQLDUMP: {error.decode('utf-8', errors='ignore')}")
+            print(f" ERROR DE MYSQLDUMP: {error.decode('utf-8', errors='ignore')}")
             return jsonify({"error": "No se pudo crear el respaldo. Revisa la consola."}), 500
 
         buffer = io.BytesIO(salida)
@@ -596,8 +704,12 @@ def reporte_adeudo_individual(matricula):
                 if vencido:
                     deuda = float(e.monto) - float(p.monto_abonado or 0)
                     if deuda > 0:
-                        conceptos_adeudados.append({"concepto": e.concepto, "monto": deuda})
+                        # ASEGURAR PASAR e.semestre AQUI
+                        conceptos_adeudados.append({"concepto": e.concepto, "monto": deuda, "semestre": e.semestre})
                         total_deuda += deuda
+                        
+        # APLICAR EL ORDENAMIENTO INTELIGENTE A LA LISTA DEL ALUMNO INDIVIDUAL
+        conceptos_adeudados = ordenar_conceptos_escolares(conceptos_adeudados)
 
         # 3. Formatear para tu motor "generar_pdf_deudores_pro"
         data_agrupada = []
@@ -619,7 +731,6 @@ def reporte_adeudo_individual(matricula):
         nombre_archivo = f"Aviso_Adeudo_{matricula}.pdf"
         mensaje_vacio = f"El alumno con matrícula {matricula} no tiene adeudos vencidos."
 
-        # 🔥 MODIFICADO: Se añade es_individual=True para que las tablas grandes fluyan bien
         return generar_pdf_deudores_pro(data_agrupada, titulo, nombre_archivo, mensaje_vacio, descargar=False, es_individual=True)
 
     except Exception as e: 
