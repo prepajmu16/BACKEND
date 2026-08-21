@@ -3,6 +3,7 @@ import io
 import os
 import re
 import pandas as pd
+import platform
 import traceback
 from datetime import datetime, date
 from sqlalchemy import func 
@@ -628,17 +629,19 @@ def respaldo_db():
         return jsonify({"error": "Solo el nivel SISTEMAS puede generar respaldos físicos de la base de datos"}), 403
 
     DB_HOST = 'localhost'
-    DB_USER = 'root'    
-    DB_PASS = ''        
-    DB_NAME = 'sistema_prepajmu' 
+    DB_USER = 'jmu_user'    
+    DB_PASS = 'Jmu12345*'        
+    DB_NAME = 'jmu_bd_nueva' 
 
-    ruta_mysqldump = r"C:\xampp\mysql\bin\mysqldump.exe" 
+    if platform.system() == 'Windows':
+        ruta_mysqldump = r"C:\xampp\mysql\bin\mysqldump.exe"
+    else:
+        ruta_mysqldump = "mysqldump" 
     
     if DB_PASS == '':
         comando = f"{ruta_mysqldump} -h {DB_HOST} -u {DB_USER} {DB_NAME}"
     else:
         comando = f"{ruta_mysqldump} -h {DB_HOST} -u {DB_USER} -p{DB_PASS} {DB_NAME}"
-
     try:
         proceso = subprocess.Popen(comando, stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=True)
         salida, error = proceso.communicate()
